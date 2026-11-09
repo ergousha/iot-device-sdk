@@ -105,6 +105,9 @@ pub struct JobsClient<S, I> {
     /// `$next/get`; settling it again would only be refused again, in a loop
     /// as fast as the round trip.
     dropped: Vec<String>,
+    /// The platform product this firmware is, if set with
+    /// [`Self::with_product`].
+    product: Option<String>,
 }
 
 /// A job outcome on its way to the Jobs service.
@@ -155,6 +158,7 @@ impl<S: Store, I: Installer> JobsClient<S, I> {
             boot,
             settling: None,
             dropped: Vec::new(),
+            product: None,
         };
         if let Some(pending) = client.store.load() {
             if jobs::was_activated(&pending, &client.boot) {
@@ -179,6 +183,16 @@ impl<S: Store, I: Installer> JobsClient<S, I> {
         client
     }
 
+    /// Refuses (REJECTED) every update whose job document names another
+    /// product, before anything is downloaded and before the version is even
+    /// compared: two products may well share a version number. A document
+    /// that names no product (from before the platform had products) is still
+    /// accepted.
+    pub fn with_product(mut self, product: &str) -> Self {
+        self.product = Some(product.to_string());
+        self
+    }
+
     /// Subscribes, then reports the outcome still owed, or else asks for any
     /// job that is already queued. Safe to call again after a reconnect.
     pub fn start(&mut self, client: &mut impl Transport) -> Result<(), String> {
@@ -190,6 +204,11 @@ impl<S: Store, I: Installer> JobsClient<S, I> {
         }
         client.publish(&self.next_get, b"{}")?;
         Ok(())
+    }
+
+    /// True when `product` is named and is not this firmware's product.
+    fn is_other_product(&self, product: &str) -> bool {
+        matches!(&self.product, Some(own) if !product.is_empty() && product != own)
     }
 
     /// Sends an outcome again if the Jobs service has not acknowledged it by
@@ -266,7 +285,19 @@ impl<S: Store, I: Installer> JobsClient<S, I> {
             return Next::Continue;
         }
 
-        let next = jobs::parse_next(payload);
+        let next = match jobs::parse_next(payload) {
+            Ok(NextJob::Install(job)) if self.is_other_product(&job.product) => {
+                Ok(NextJob::Refused {
+                    reason: format!(
+                        "the image is for product {:?}, this device is {:?}",
+                        job.product,
+                        self.product.as_deref().unwrap_or_default()
+                    ),
+                    job_id: job.job_id,
+                })
+            }
+            other => other,
+        };
         if let Ok(
             NextJob::Install(FirmwareJob { job_id, .. })
             | NextJob::Settle(PendingUpdate { job_id, .. })
@@ -1105,6 +1136,51 @@ mod tests {
     }
 
     // --- refusing -----------------------------------------------------------------
+
+    #[test]
+    fn an_image_for_another_product_is_rejected_without_a_download() {
+        let mut client = idle_client().with_product("gateway");
+        let mut wire = Wire::default();
+        // Same version as the running one: the product is checked first, so a
+        // version shared between products is never taken as "already running".
+        let other = offer(JOB, |e| {
+            e["jobDocument"]["product"] = "vaktus".into();
+            e["jobDocument"]["firmware_version"] = "firmware_v0.1.0".into();
+        });
+        deliver(&mut client, &mut wire, "$next/get/accepted", &other);
+        assert_eq!(client.installer.installs, 0);
+        let updates = wire.updates();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0]["status"], "REJECTED");
+        assert_eq!(
+            updates[0]["statusDetails"]["detail"],
+            r#"the image is for product "vaktus", this device is "gateway""#
+        );
+    }
+
+    #[test]
+    fn an_image_for_this_product_or_none_is_installed() {
+        for product in [Some("gateway"), None] {
+            let mut client = idle_client().with_product("gateway");
+            let mut wire = Wire::default();
+            let job = offer(JOB, |e| {
+                if let Some(p) = product {
+                    e["jobDocument"]["product"] = p.into();
+                }
+            });
+            deliver(&mut client, &mut wire, "$next/get/accepted", &job);
+            assert_eq!(client.installer.installs, 1, "product {product:?}");
+        }
+    }
+
+    #[test]
+    fn without_a_product_set_any_product_is_installed() {
+        let mut client = idle_client();
+        let mut wire = Wire::default();
+        let job = offer(JOB, |e| e["jobDocument"]["product"] = "vaktus".into());
+        deliver(&mut client, &mut wire, "$next/get/accepted", &job);
+        assert_eq!(client.installer.installs, 1);
+    }
 
     #[test]
     fn a_refused_job_is_reported_rejected_instead_of_staying_queued() {
