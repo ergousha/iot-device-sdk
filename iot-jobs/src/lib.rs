@@ -12,9 +12,12 @@
 //! already running is settled without installing anything
 //! ([`is_already_running`]).
 //!
-//! Only the pure parts live here: parsing `$next/get/accepted`, deciding the
-//! outcome, and encoding the status updates. NVS, the OTA partitions and MQTT
-//! are the firmware's.
+//! The pure parts live here: parsing `$next/get/accepted`, deciding the
+//! outcome, and encoding the status updates. The state machine that drives
+//! them is [`client`], written against narrow traits so it runs on the host
+//! too. NVS, the OTA partitions and MQTT are the firmware's.
+
+pub mod client;
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -50,6 +53,19 @@ pub const REASON_NOT_VALID: &str = "not marked valid";
 pub const REASON_UNCONFIRMED: &str = "unconfirmed";
 /// `statusDetails.reason`: the image was never activated.
 pub const REASON_INSTALL_FAILED: &str = "install failed";
+/// `statusDetails.reason`: [`MAX_DOWNLOAD_ATTEMPTS`] downloads in a row never
+/// finished, the device crashing or losing power during each.
+pub const REASON_DOWNLOAD_INTERRUPTED: &str = "download interrupted";
+/// `statusDetails.reason`: the firmware will not run the job as written.
+pub const REASON_REFUSED: &str = "refused";
+
+/// Downloads of one job the device starts before it gives up on it.
+///
+/// A download that crashes the device, or that power keeps being cut during,
+/// never reports anything: the execution stays IN_PROGRESS in
+/// [`PHASE_DOWNLOADING`] and is offered again at every boot. Without a count
+/// the device would download it at every boot until the job timed out.
+pub const MAX_DOWNLOAD_ATTEMPTS: u32 = 3;
 
 /// `stepTimeoutInMinutes` sent with the [`PHASE_REBOOTING`] update.
 ///
@@ -220,6 +236,86 @@ pub fn settle(pending: &PendingUpdate, boot: &BootFacts) -> Outcome {
 
 fn failed(reason: &'static str, detail: String) -> Outcome {
     Outcome::Failed { reason, detail }
+}
+
+/// Whether the image `pending` recorded was ever made the boot slot.
+///
+/// The record is written just before activation, so a power cut between the
+/// two leaves a record for an image that never booted: the device comes back
+/// on the image that downloaded it, from its own slot, and the bootloader has
+/// marked nothing invalid. [`settle`] would call that a rollback. It is not
+/// one: in a real rollback the bootloader marks the target slot invalid. The
+/// update never happened, so the record is dropped and the execution, still
+/// IN_PROGRESS in [`PHASE_DOWNLOADING`], is offered and downloaded again.
+///
+/// Anything less clear-cut counts as activated and is settled as before: the
+/// slots unknown, the target slot marked invalid, or a running version other
+/// than the one that took the job.
+///
+/// A target slot marked invalid by an *earlier* failed update looks like a
+/// rollback too, and is settled as one; the bootloader keeps no finer record.
+pub fn was_activated(pending: &PendingUpdate, boot: &BootFacts) -> bool {
+    let target_slot = pending.target_slot.as_str();
+    let running_slot = boot.running_slot.as_str();
+    let from = normalize_version(&pending.from_version);
+    let still_the_old_image = !target_slot.is_empty()
+        && !running_slot.is_empty()
+        && running_slot != target_slot
+        && boot.invalid_slot.as_deref() != Some(target_slot)
+        && !from.is_empty()
+        && from == normalize_version(&boot.running_version);
+    !still_the_old_image
+}
+
+/// Downloads of one job started so far; kept in NVS next to [`PendingUpdate`]
+/// so that a crash cannot reset the count.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DownloadAttempts {
+    /// Job id.
+    pub job_id: String,
+    /// Downloads started, this one included.
+    pub count: u32,
+}
+
+/// The count to record before downloading `job_id`, or `None` once
+/// [`MAX_DOWNLOAD_ATTEMPTS`] downloads of it have started and none finished.
+/// A record for another job is stale, and the count starts over.
+pub fn next_attempt(previous: Option<&DownloadAttempts>, job_id: &str) -> Option<DownloadAttempts> {
+    let count = match previous {
+        Some(p) if p.job_id == job_id => p.count,
+        _ => 0,
+    };
+    (count < MAX_DOWNLOAD_ATTEMPTS).then(|| DownloadAttempts {
+        job_id: job_id.to_string(),
+        count: count + 1,
+    })
+}
+
+/// Whether the job is still wanted, from the answer to a
+/// `$aws/things/{thing}/jobs/{jobId}/get` (DescribeJobExecution) request:
+/// `accepted` tells whether it came on `…/get/accepted` or `…/get/rejected`.
+///
+/// Asked once the image is written and before it is activated, because the
+/// download blocks everything else and a job cancelled meanwhile would
+/// otherwise still be installed. `Err` says why it is not wanted. Anything
+/// unclear — an unreadable answer, a throttled request — is `Ok`: the check
+/// spares a needless update, and must not turn into a way for one to fail.
+pub fn execution_wanted(accepted: bool, payload: &[u8]) -> Result<(), String> {
+    if !accepted {
+        let rejection = parse_rejection(payload);
+        return match rejection.code.as_str() {
+            "ResourceNotFound" => Err(format!("the job is gone ({rejection})")),
+            _ => Ok(()),
+        };
+    }
+    let status = serde_json::from_slice::<Value>(payload)
+        .ok()
+        .and_then(|v| v["execution"]["status"].as_str().map(str::to_string))
+        .unwrap_or_default();
+    match status.as_str() {
+        "" | "QUEUED" | "IN_PROGRESS" => Ok(()),
+        other => Err(format!("its execution is {other}")),
+    }
 }
 
 /// True when `job` names the version this image already is, and this image
@@ -523,6 +619,27 @@ pub fn install_failed(job: &FirmwareJob, error: &str) -> StatusUpdate {
         .detail("target", &job.target_version)
 }
 
+/// FAILED, for a job whose downloads never finished
+/// ([`MAX_DOWNLOAD_ATTEMPTS`]).
+pub fn download_interrupted(job: &FirmwareJob, attempts: u32) -> StatusUpdate {
+    StatusUpdate::new("FAILED")
+        .detail("reason", REASON_DOWNLOAD_INTERRUPTED)
+        .detail(
+            "detail",
+            &format!("{attempts} downloads started and none finished; the device crashed or lost power during each"),
+        )
+        .detail("target", &job.target_version)
+}
+
+/// REJECTED, for a firmware job this firmware will not run
+/// ([`NextJob::Refused`]). Left alone, it would stay QUEUED, and be offered
+/// again at every boot.
+pub fn refused(reason: &str) -> StatusUpdate {
+    StatusUpdate::new("REJECTED")
+        .detail("reason", REASON_REFUSED)
+        .detail("detail", reason)
+}
+
 /// SUCCEEDED, for a job [`is_already_running`] found nothing to do for.
 pub fn already_running(boot: &BootFacts) -> StatusUpdate {
     StatusUpdate::new("SUCCEEDED")
@@ -659,10 +776,115 @@ mod tests {
 
     #[test]
     fn booting_the_other_slot_is_a_rollback_even_without_the_bootloader_saying_so() {
-        // E.g. power lost after the record was written but before the new
-        // slot was activated.
         let outcome = settle(&pending(), &booted("0.1.0", "ota_0"));
         assert_eq!(reason(&outcome), REASON_ROLLED_BACK);
+    }
+
+    // --- was_activated ----------------------------------------------------------
+
+    #[test]
+    fn a_power_cut_before_activation_is_not_an_update() {
+        // The image that downloaded it, in its own slot, nothing invalid.
+        assert!(!was_activated(&pending(), &booted("0.1.0", "ota_0")));
+    }
+
+    #[test]
+    fn a_rollback_or_the_new_image_was_activated() {
+        let mut rolled_back = booted("0.1.0", "ota_0");
+        rolled_back.invalid_slot = Some("ota_1".into());
+        assert!(was_activated(&pending(), &rolled_back));
+        assert!(was_activated(&pending(), &booted("0.2.0", "ota_1")));
+        // The new slot runs, whatever version it turned out to be.
+        assert!(was_activated(&pending(), &booted("0.1.0", "ota_1")));
+    }
+
+    #[test]
+    fn when_in_doubt_the_update_counts_as_activated() {
+        // Another image altogether, e.g. flashed over USB since.
+        assert!(was_activated(&pending(), &booted("0.0.9", "ota_0")));
+        assert!(was_activated(&pending(), &booted("0.1.0", "")));
+        let mut no_slot = pending();
+        no_slot.target_slot.clear();
+        assert!(was_activated(&no_slot, &booted("0.1.0", "ota_0")));
+        let mut no_from = pending();
+        no_from.from_version.clear();
+        assert!(was_activated(&no_from, &booted("0.1.0", "ota_0")));
+    }
+
+    // --- download attempts ------------------------------------------------------
+
+    #[test]
+    fn downloads_are_counted_per_job_and_capped() {
+        let first = next_attempt(None, "a").unwrap();
+        assert_eq!(first.count, 1);
+        let mut last = first;
+        for expected in 2..=MAX_DOWNLOAD_ATTEMPTS {
+            last = next_attempt(Some(&last), "a").unwrap();
+            assert_eq!(last.count, expected);
+        }
+        assert_eq!(next_attempt(Some(&last), "a"), None);
+        // Another job starts over.
+        assert_eq!(next_attempt(Some(&last), "b").unwrap().count, 1);
+    }
+
+    #[test]
+    fn a_job_whose_downloads_never_finish_fails() {
+        let update = download_interrupted(&job_for("firmware_v0.3.0"), 3);
+        assert_eq!(update.status(), "FAILED");
+        assert_eq!(
+            update.detail_value("reason"),
+            Some(REASON_DOWNLOAD_INTERRUPTED)
+        );
+        assert_eq!(update.detail_value("target"), Some("0.3.0"));
+    }
+
+    // --- execution_wanted -------------------------------------------------------
+
+    fn described(status: &str) -> Vec<u8> {
+        format!(
+            r#"{{"execution":{{"jobId":"j","status":"{status}","versionNumber":3}},"timestamp":1}}"#
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn an_open_execution_is_still_wanted() {
+        assert_eq!(execution_wanted(true, &described("IN_PROGRESS")), Ok(()));
+        assert_eq!(execution_wanted(true, &described("QUEUED")), Ok(()));
+    }
+
+    #[test]
+    fn a_cancelled_or_ended_execution_is_not() {
+        for status in ["CANCELED", "TIMED_OUT", "REMOVED", "FAILED"] {
+            let why = execution_wanted(true, &described(status)).unwrap_err();
+            assert!(why.contains(status), "{why}");
+        }
+        assert!(execution_wanted(
+            false,
+            br#"{"code":"ResourceNotFound","message":"no such job"}"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn an_unclear_answer_does_not_stop_an_update() {
+        assert_eq!(execution_wanted(true, b"garbage"), Ok(()));
+        assert_eq!(execution_wanted(true, b"{}"), Ok(()));
+        assert_eq!(
+            execution_wanted(false, br#"{"code":"RequestThrottled"}"#),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn a_refused_job_is_rejected_with_the_reason() {
+        let update = refused("download_url is not https");
+        assert_eq!(update.status(), "REJECTED");
+        assert_eq!(update.detail_value("reason"), Some(REASON_REFUSED));
+        assert_eq!(
+            update.detail_value("detail"),
+            Some("download_url is not https")
+        );
     }
 
     #[test]
