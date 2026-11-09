@@ -300,10 +300,17 @@ pub fn next_attempt(previous: Option<&DownloadAttempts>, job_id: &str) -> Option
 /// otherwise still be installed. `Err` says why it is not wanted. Anything
 /// unclear — an unreadable answer, a throttled request — is `Ok`: the check
 /// spares a needless update, and must not turn into a way for one to fail.
+///
+/// The service does not describe an execution that has ended: it refuses
+/// with `TerminalStateReached` rather than answering `CANCELED`. A job that
+/// was deleted is `ResourceNotFound`.
 pub fn execution_wanted(accepted: bool, payload: &[u8]) -> Result<(), String> {
     if !accepted {
         let rejection = parse_rejection(payload);
         return match rejection.code.as_str() {
+            "TerminalStateReached" | "InvalidStateTransition" => {
+                Err(format!("its execution has ended ({rejection})"))
+            }
             "ResourceNotFound" => Err(format!("the job is gone ({rejection})")),
             _ => Ok(()),
         };
@@ -859,6 +866,10 @@ mod tests {
             let why = execution_wanted(true, &described(status)).unwrap_err();
             assert!(why.contains(status), "{why}");
         }
+        // What the service really answers for a cancelled execution.
+        let cancelled = br#"{"code":"TerminalStateReached","message":"Job Execution has reached terminal state. It is neither IN_PROGRESS nor QUEUED"}"#;
+        let why = execution_wanted(false, cancelled).unwrap_err();
+        assert!(why.contains("has ended"), "{why}");
         assert!(execution_wanted(
             false,
             br#"{"code":"ResourceNotFound","message":"no such job"}"#

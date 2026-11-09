@@ -523,7 +523,19 @@ impl Describe {
             return Ok(());
         }
         match client.wait_for(&[&self.accepted, &self.rejected], DESCRIBE_TIMEOUT) {
-            Some((topic, payload)) => jobs::execution_wanted(topic == self.accepted, &payload),
+            Some((topic, payload)) => {
+                let wanted = jobs::execution_wanted(topic == self.accepted, &payload);
+                if wanted.is_ok() {
+                    log::info!(
+                        "the job is still wanted ({}); activating the image",
+                        String::from_utf8_lossy(&payload)
+                            .chars()
+                            .take(160)
+                            .collect::<String>()
+                    );
+                }
+                wanted
+            }
             None => {
                 log::warn!(
                     "no answer within {} s on whether the job is still wanted; installing it",
@@ -982,6 +994,23 @@ mod tests {
         // Nothing reported past `downloading`: the execution has ended.
         assert_eq!(wire.updates().len(), 1);
         assert!(wire.asked_for_next());
+    }
+
+    #[test]
+    fn a_job_cancelled_during_the_download_is_refused_a_description_and_not_installed() {
+        // How the service actually answers for a cancelled execution.
+        let mut client = idle_client();
+        let mut wire = Wire::default();
+        wire.answers.push_back((
+            topic(&format!("{JOB}/get/rejected")),
+            br#"{"code":"TerminalStateReached","message":"Job Execution has reached terminal state. It is neither IN_PROGRESS nor QUEUED"}"#.to_vec(),
+        ));
+        assert_eq!(
+            deliver(&mut client, &mut wire, "$next/get/accepted", &queued()),
+            Next::Continue
+        );
+        assert!(!client.installer.activated);
+        assert_eq!(client.store.load(), None);
     }
 
     #[test]
