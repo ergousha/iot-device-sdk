@@ -1,6 +1,6 @@
 [package]
 name = "iot-jobs"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2021"
 publish = false
 description = "AWS IoT Jobs firmware-update protocol for the ESP32 devices of iot-platform-infra: job document parsing, outcome settling across the reboot, and the host-testable Jobs state machine. No esp-idf, no I/O."
