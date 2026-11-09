@@ -108,6 +108,10 @@ pub struct FirmwareJob {
     /// `firmware_version` from the job document, normalised with
     /// [`normalize_version`]. Empty if the document names none.
     pub target_version: String,
+    /// `product` from the job document: the platform product the image is
+    /// built for (`gateway`, `vaktus`). Empty in documents from before the
+    /// platform had products.
+    pub product: String,
 }
 
 impl FirmwareJob {
@@ -487,6 +491,7 @@ pub fn parse_next(payload: &[u8]) -> Result<NextJob, MalformedJob> {
         job_id,
         url,
         target_version,
+        product: text(&doc, "product"),
     }))
 }
 
@@ -989,6 +994,7 @@ mod tests {
 
     fn job_for(version: &str) -> FirmwareJob {
         FirmwareJob {
+            product: String::new(),
             job_id: "j".into(),
             url: "https://x".into(),
             target_version: normalize_version(version).to_string(),
@@ -1250,6 +1256,7 @@ mod tests {
     #[test]
     fn details_are_values_aws_accepts() {
         let job = FirmwareJob {
+            product: String::new(),
             job_id: "j".into(),
             url: "https://x".into(),
             target_version: String::new(),
