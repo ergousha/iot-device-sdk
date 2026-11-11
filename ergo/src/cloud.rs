@@ -10,9 +10,11 @@ use crate::record::Record;
 /// SSM parameter the platform's kill switch writes (`claim-window.sh` reads
 /// the same one).
 pub const GUARD_STATE_PARAMETER: &str = "/esp32-ztp/guard/state";
-/// SSM parameters holding the shared claim credential.
-pub const CLAIM_CERT_PARAMETER: &str = "/esp32-ztp/poc/claim_certificate_pem";
-pub const CLAIM_KEY_PARAMETER: &str = "/esp32-ztp/poc/claim_private_key";
+/// SSM parameters holding the shared claim credential. The platform's OTA
+/// controller writes them when it rotates the claim (after site windows and
+/// on demand); nothing but `ergo` reads them.
+pub const CLAIM_CERT_PARAMETER: &str = "/iot-platform/claim/cert";
+pub const CLAIM_KEY_PARAMETER: &str = "/iot-platform/claim/key";
 /// The IoT policy whose single target is the claim certificate.
 pub const CLAIM_POLICY: &str = "esp32-ztp-claim-policy";
 
@@ -109,7 +111,7 @@ pub fn check_guard(state: &str) -> Result<()> {
     if value.get("tripped") != Some(&serde_json::Value::Bool(false)) {
         bail!(
             "refusing: the guard is tripped: {state}\n\
-             investigate, then run iot-platform-infra/scripts/guard-reset.sh"
+             investigate, then run iot-platform/scripts/guard-reset.sh"
         );
     }
     Ok(())
