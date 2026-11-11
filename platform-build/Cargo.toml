@@ -1,0 +1,17 @@
+[package]
+name = "platform-build"
+description = "Build-script helper for platform product firmware: reads platform.toml, pins FW_VERSION, compiles in the endpoint, template and signing keyring, checks the frozen partition layout, and stages the bootloader. Never touches AWS or a secret."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde.workspace = true
+toml = "0.8"
+# Version parsing and keyring validation, shared with the device.
+iot-jobs = { path = "../iot-jobs" }
+device-core = { path = "../device-core" }
+# espidf: relays esp-idf-sys's build configuration and finds the bootloader.
+embuild = { version = "0.33", features = ["espidf"] }

@@ -1,0 +1,37 @@
+name: Zizmor Security Checks
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - '.github/workflows/**'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - '.github/workflows/**'
+
+concurrency:
+  group: zizmor-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  zizmor:
+    name: Zizmor Security Linter
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    # zizmor installs with a plain stable toolchain.
+    env:
+      RUSTUP_TOOLCHAIN: stable
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+
+      - name: Install zizmor
+        run: cargo install zizmor --locked
+
+      - name: Run zizmor
+        run: zizmor .github/workflows/

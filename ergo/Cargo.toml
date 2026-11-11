@@ -1,0 +1,29 @@
+[package]
+name = "ergo"
+description = "The owner's bench CLI: registers devices in the provisioning registry, commissions a device over its USB serial console inside a short claim window, and inspects NVS partition dumps."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+device-core = { path = "../device-core" }
+nvs-image = { path = "../nvs-image" }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde_json.workspace = true
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal", "sync"] }
+# No libudev: port enumeration is not needed, the port is named on the command line.
+serialport = { version = "4", default-features = false }
+# Default features select the SDK's legacy HTTPS client (hyper 0.14 +
+# rustls 0.21), which carries open advisories.
+aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio", "sso"] }
+aws-sdk-dynamodb = { version = "1", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
+aws-sdk-ssm = { version = "1", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
+aws-sdk-iot = { version = "1", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
+
+[dev-dependencies]
+# Paused time: the commission flow's 30 s / 5 s / minutes-long waits run instantly.
+tokio = { version = "1", features = ["test-util"] }
+base64.workspace = true

@@ -1,0 +1,12 @@
+[package]
+name = "nvs-image"
+description = "Reads an ESP-IDF NVS partition image (a flash dump or nvs_partition_gen.py output) on the host, so tests can prove the SDK reads what devices in the field already store."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+device-core = { path = "../device-core" }
+crc32fast = "1"

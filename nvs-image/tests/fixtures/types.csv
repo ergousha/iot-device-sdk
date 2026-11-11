@@ -1,0 +1,12 @@
+key,type,encoding,value
+types,namespace,,
+u8,data,u8,255
+i8,data,i8,-128
+u16,data,u16,65535
+i16,data,i16,-32768
+u32,data,u32,4294967295
+i32,data,i32,-2147483648
+u64,data,u64,18446744073709551615
+i64,data,i64,-9223372036854775808
+str,data,string,hello
+blob,data,hex2bin,deadbeef

@@ -1,0 +1,35 @@
+# The Ergousha IoT device SDK: everything a product firmware needs to live on
+# the platform (ergousha/iot-platform), and the owner's bench tool.
+#
+#   iot-jobs        AWS IoT Jobs OTA protocol: job documents, signed manifests,
+#                   monotonic versions, outcome settling across the reboot
+#   device-core     platform contracts as pure logic: provisioning wire format,
+#                   CSR, the `platform` shadow, publish limiter, backoff, the
+#                   serial console protocol, the frozen NVS layouts
+#   device-sdk      the ESP-IDF glue (MQTT, NVS, OTA, ATECC608B or NVS soft key)
+#   platform-build  build-script helper: platform.toml, FW_VERSION, keyring,
+#                   partition check, bootloader staging. No AWS, no secrets
+#   nvs-image       reads an ESP-IDF NVS partition dump on the host
+#   ergo            the owner's CLI: register and commission devices
+#
+# device-sdk links ESP-IDF and only builds for an ESP32 target, from a product
+# repository. Everything else builds and tests on the host: `cargo test`.
+[workspace]
+resolver = "2"
+members = ["iot-jobs", "device-core", "nvs-image", "platform-build", "ergo", "device-sdk"]
+default-members = ["iot-jobs", "device-core", "nvs-image", "platform-build", "ergo"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+repository = "https://github.com/ergousha/iot-device-sdk"
+publish = false
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+log = "0.4"
+sha2 = { version = "0.10", default-features = false }
+base64 = "0.22"
+p256 = "0.13"

@@ -1,0 +1,14 @@
+key,type,encoding,value
+device_id,namespace,,
+cert,data,string,"-----BEGIN CERTIFICATE-----
+FAKE
+-----END CERTIFICATE-----
+"
+key,data,string,"-----BEGIN EC PRIVATE KEY-----
+FAKE
+-----END EC PRIVATE KEY-----
+"
+thing,data,string,28848553144F
+platform,namespace,,
+boot_cnt,data,u32,3
+boot_fw,data,string,0.4.0

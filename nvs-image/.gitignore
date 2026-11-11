@@ -1,0 +1,4 @@
+# Real device NVS dumps hold private keys, certificates and Wi-Fi passwords.
+# They are read from outside the repository (NVS_DUMP=...) and never committed.
+*.nvs.bin
+dumps/

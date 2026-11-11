@@ -1,0 +1,54 @@
+name: CI
+
+# Host crates only: fmt, clippy, tests. device-sdk links ESP-IDF and is built
+# by the product repositories' firmware CI, against a pinned revision of this
+# one. No secrets, no AWS, no caches with anything in them but dependencies.
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+permissions: {}
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  host:
+    name: fmt, clippy, test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test
+
+      # The contract test vector must verify with the same tool releases sign
+      # with, not only with this crate's verifier.
+      - name: Contract vector (openssl)
+        run: |
+          cd contract/v1
+          openssl dgst -sha256 -verify test-key.pub.pem \
+            -signature <(openssl base64 -d -A < manifest.sig) manifest.json

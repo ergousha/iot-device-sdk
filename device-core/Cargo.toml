@@ -1,0 +1,20 @@
+[package]
+name = "device-core"
+description = "The platform's device contracts as pure logic: provisioning wire format, CSR, the platform shadow, publish limiter, backoff, serial console protocol, frozen NVS layouts. No esp-idf, no I/O; tested on the host."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+base64.workspace = true
+
+[dev-dependencies]
+# Host tests of csr.rs: a software P-256 key stands in for the device key, and
+# the result is parsed back as PKCS#10.
+p256.workspace = true
+x509-cert = "0.2"
