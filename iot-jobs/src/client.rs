@@ -642,6 +642,9 @@ impl Describe {
 
     /// Asks, and waits up to [`DESCRIBE_TIMEOUT`]. No answer is a yes.
     fn still_wanted(&self, client: &mut impl Transport) -> Result<(), String> {
+        // Again: the installer may have paused the connection for the
+        // download, and a new session has no subscriptions.
+        self.subscribe(client);
         if let Err(e) = client.publish(&self.get, br#"{"includeJobDocument":false}"#) {
             log::warn!("could not ask whether the job is still wanted ({e}); installing it");
             return Ok(());

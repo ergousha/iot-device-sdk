@@ -26,8 +26,9 @@ use device_core::product::Limits;
 use esp_idf_svc::sys::{
     esp_event_base_t, esp_mqtt_client_config_t, esp_mqtt_client_destroy, esp_mqtt_client_handle_t,
     esp_mqtt_client_init, esp_mqtt_client_publish, esp_mqtt_client_reconnect,
-    esp_mqtt_client_register_event, esp_mqtt_client_start, esp_mqtt_client_subscribe_single,
-    esp_mqtt_client_unsubscribe, esp_mqtt_error_type_t_MQTT_ERROR_TYPE_CONNECTION_REFUSED,
+    esp_mqtt_client_register_event, esp_mqtt_client_start, esp_mqtt_client_stop,
+    esp_mqtt_client_subscribe_single, esp_mqtt_client_unsubscribe,
+    esp_mqtt_error_type_t_MQTT_ERROR_TYPE_CONNECTION_REFUSED,
     esp_mqtt_error_type_t_MQTT_ERROR_TYPE_TCP_TRANSPORT, esp_mqtt_event_id_t_MQTT_EVENT_ANY,
     esp_mqtt_event_id_t_MQTT_EVENT_CONNECTED, esp_mqtt_event_id_t_MQTT_EVENT_DATA,
     esp_mqtt_event_id_t_MQTT_EVENT_DISCONNECTED, esp_mqtt_event_id_t_MQTT_EVENT_ERROR,
@@ -290,6 +291,11 @@ impl Mqtt {
     }
 
     /// Starts one reconnection attempt (with auto-reconnect off).
+    /// A handle that can pause and resume this client, for the OTA download.
+    pub(crate) fn pause_handle(&self) -> Pause {
+        Pause(self.handle)
+    }
+
     pub fn reconnect(&self) -> Result<()> {
         // SAFETY: a live handle.
         let err = unsafe { esp_mqtt_client_reconnect(self.handle) };
@@ -297,6 +303,35 @@ impl Mqtt {
             bail!("esp_mqtt_client_reconnect: {err}");
         }
         Ok(())
+    }
+}
+
+/// Stops and restarts a client, so an OTA download gets the heap the MQTT
+/// session holds (its TLS context, buffers and task stack).
+#[derive(Clone, Copy)]
+pub(crate) struct Pause(esp_mqtt_client_handle_t);
+
+// Used from the thread that owns the client; esp-mqtt locks internally.
+unsafe impl Send for Pause {}
+
+impl Pause {
+    /// Disconnects and ends the client's task. Not from the esp-mqtt task.
+    pub(crate) fn stop(&self) {
+        // SAFETY: the handle outlives the session that made this Pause, and
+        // the caller is not the esp-mqtt task.
+        let err = unsafe { esp_mqtt_client_stop(self.0) };
+        if err != ESP_OK {
+            log::warn!("esp_mqtt_client_stop: {err}");
+        }
+    }
+
+    /// Starts the client again; it connects in the background.
+    pub(crate) fn start(&self) {
+        // SAFETY: as for stop.
+        let err = unsafe { esp_mqtt_client_start(self.0) };
+        if err != ESP_OK {
+            log::warn!("esp_mqtt_client_start: {err}");
+        }
     }
 }
 

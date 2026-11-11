@@ -156,7 +156,9 @@ impl Session {
         let jobs = JobsClient::new(
             &identity.thing_name,
             JobStore::new(p.nvs.clone())?,
-            Ota,
+            Ota {
+                mqtt: client.pause_handle(),
+            },
             facts,
         )
         .with_product(product.id)

@@ -53,8 +53,19 @@ impl Transport for Link<'_> {
     }
 }
 
+/// How long the MQTT session gets to come back after the download before
+/// the job is asked about; requests sent earlier wait in esp-mqtt's outbox.
+const RESUME_GRACE: Duration = Duration::from_secs(3);
+
 /// The OTA partitions.
-pub struct Ota;
+///
+/// The MQTT session is paused for the download: its TLS context, buffers
+/// and task stack are heap an HTTPS download needs, a 16.7 KB TLS record
+/// block above all, and the gateway did not have it while both ran. It is
+/// started again before the job is asked whether it is still wanted.
+pub struct Ota {
+    pub(crate) mqtt: crate::mqtt::Pause,
+}
 
 impl Installer for Ota {
     fn install(
@@ -63,6 +74,19 @@ impl Installer for Ota {
         expected: Option<&Expected>,
         before_activate: &mut dyn FnMut(&str) -> Result<(), String>,
     ) -> Result<String, InstallError> {
-        crate::ota::perform_ota(url, expected, before_activate)
+        let mqtt = self.mqtt;
+        log::info!("OTA: pausing MQTT for the download");
+        mqtt.stop();
+        let mut resumed = false;
+        let result = crate::ota::perform_ota(url, expected, |slot| {
+            mqtt.start();
+            resumed = true;
+            std::thread::sleep(RESUME_GRACE);
+            before_activate(slot)
+        });
+        if !resumed {
+            mqtt.start();
+        }
+        result
     }
 }
