@@ -3,3 +3,4 @@
 # NVS dumps of real devices hold private keys and WiFi passwords.
 *.nvs.bin
 dumps/
+CLAUDE.md
