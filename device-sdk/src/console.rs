@@ -16,7 +16,8 @@ use crate::key::DeviceKey;
 use crate::kv::NvsKv;
 use crate::Platform;
 
-const STACK: usize = 8 * 1024;
+/// Enough for base64, NVS and generating or parsing a P-256 key.
+const STACK: usize = 6 * 1024;
 const POLL: Duration = Duration::from_millis(50);
 
 /// Prints one protocol line, whole.

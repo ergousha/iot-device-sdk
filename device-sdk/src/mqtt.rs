@@ -172,11 +172,14 @@ impl Mqtt {
         cfg.network.timeout_ms = 20_000;
         cfg.network.disable_auto_reconnect = !settings.auto_reconnect;
         cfg.buffer.size = settings.buffer_size;
-        // Room for the largest payload the limiter admits, plus the topic.
-        cfg.buffer.out_size = settings.buffer_size.max(6 * 1024);
-        // The TLS handshake (and with the secure element, the ATECC calls)
-        // runs on this task.
-        cfg.task.stack_size = 8192;
+        // esp-mqtt sends a message larger than the output buffer in pieces,
+        // so it stays small: every byte of it is heap the device keeps for
+        // as long as it is connected, and an OTA download's TLS needs
+        // ~16.7 KB blocks of the same heap.
+        cfg.buffer.out_size = 2048;
+        // The TLS handshake runs on this task; with the secure element the
+        // ATECC calls do too, which need the larger stack.
+        cfg.task.stack_size = if secure_element { 8192 } else { 6144 };
 
         let (tx, rx) = channel();
         let context = Box::new(Context {
