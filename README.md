@@ -131,6 +131,9 @@ jobs:
       contents: write   # tag and GitHub pre-release
       id-token: write   # AWS OIDC, in the publish job only
       issues: write     # "release vX.Y.Z failed"
+    # Environment secrets reach a called workflow only through inherit; keep
+    # no repository-level secrets in a product repository.
+    secrets: inherit # zizmor: ignore[secrets-inherit]
     with:
       flash-size: 4mb
       aws-role-arn: ${{ vars.AWS_ROLE_ARN }}
