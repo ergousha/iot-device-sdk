@@ -1,11 +1,18 @@
 [package]
 name = "iot-jobs"
-version = "0.3.0"
-edition = "2021"
-publish = false
-description = "AWS IoT Jobs firmware-update protocol for the ESP32 devices of iot-platform-infra: job document parsing, outcome settling across the reboot, and the host-testable Jobs state machine. No esp-idf, no I/O."
+version = "0.4.0"
+description = "AWS IoT Jobs firmware-update protocol for the platform's devices: job documents, signed manifests, monotonic versions, outcome settling across the reboot, and the host-testable Jobs state machine. No esp-idf, no I/O."
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
 
 [dependencies]
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-log = "0.4"
+serde.workspace = true
+serde_json.workspace = true
+log.workspace = true
+sha2.workspace = true
+base64.workspace = true
+# Manifest signatures: ECDSA P-256 verification. Pure Rust, so the same code
+# runs in the host tests and on the device.
+p256.workspace = true

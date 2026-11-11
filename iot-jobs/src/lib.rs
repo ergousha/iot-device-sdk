@@ -18,6 +18,11 @@
 //! too. NVS, the OTA partitions and MQTT are the firmware's.
 
 pub mod client;
+pub mod manifest;
+mod version;
+
+pub use manifest::{Expected, ImageCheck, Keyring, Manifest};
+pub use version::Version;
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -40,24 +45,38 @@ pub const PHASE_DOWNLOADING: &str = "downloading";
 /// or every boot would start the same update over.
 pub const PHASE_REBOOTING: &str = "rebooting";
 
-/// `statusDetails.reason`: the device is running its previous image.
-pub const REASON_ROLLED_BACK: &str = "rolled back";
-/// `statusDetails.reason`: the new image runs, but is not the version the job
-/// named.
-pub const REASON_VERSION_MISMATCH: &str = "version mismatch";
-/// `statusDetails.reason`: the new image runs but could not mark itself
-/// valid, so the next reset rolls it back.
-pub const REASON_NOT_VALID: &str = "not marked valid";
-/// `statusDetails.reason`: nothing recorded says which image the job
-/// installed, so its outcome cannot be told.
-pub const REASON_UNCONFIRMED: &str = "unconfirmed";
-/// `statusDetails.reason`: the image was never activated.
-pub const REASON_INSTALL_FAILED: &str = "install failed";
-/// `statusDetails.reason`: [`MAX_DOWNLOAD_ATTEMPTS`] downloads in a row never
-/// finished, the device crashing or losing power during each.
-pub const REASON_DOWNLOAD_INTERRUPTED: &str = "download interrupted";
-/// `statusDetails.reason`: the firmware will not run the job as written.
-pub const REASON_REFUSED: &str = "refused";
+/// `statusDetails.reason` codes (`PLATFORM.md` §8). The OTA controller acts
+/// on them: a terminal reason halts the release at its canary, `download` gets
+/// one rerun first.
+pub mod reason {
+    /// FAILED: the image did not match its manifest (sha256, size), or the
+    /// bootloader's own image check failed. Terminal.
+    pub const VERIFY: &str = "verify";
+    /// FAILED: the manifest's signature did not verify, it does not bind this
+    /// product and version, or an unsigned job reached a `signed-only`
+    /// image. Terminal.
+    pub const SIG: &str = "sig";
+    /// FAILED: the image that came up is not the version the job named, or
+    /// the job names no usable version. Terminal.
+    pub const VERSION: &str = "version";
+    /// FAILED: the device is running its previous image. Terminal.
+    pub const ROLLBACK: &str = "rollback";
+    /// FAILED: the new image runs but could not mark itself valid, or nothing
+    /// recorded says which image the job installed. Terminal.
+    pub const BOOT: &str = "boot";
+    /// FAILED: the image could not be downloaded or written, or the device
+    /// crashed during every download. Transient: worth one rerun.
+    pub const DOWNLOAD: &str = "download";
+    /// REJECTED: the job is for another product.
+    pub const PRODUCT: &str = "product";
+    /// REJECTED: an operation this firmware does not implement.
+    pub const OPERATION: &str = "operation";
+    /// REJECTED: the job document is unusable (no https URL, say).
+    pub const JOB: &str = "job";
+    /// SUCCEEDED without an install: the device already runs a greater
+    /// version, and the job did not say `downgrade`.
+    pub const ALREADY_NEWER: &str = "already-newer";
+}
 
 /// Downloads of one job the device starts before it gives up on it.
 ///
@@ -112,6 +131,23 @@ pub struct FirmwareJob {
     /// built for (`gateway`, `vaktus`). Empty in documents from before the
     /// platform had products.
     pub product: String,
+    /// The signed manifest (job document contract 1.1), if the job carries
+    /// one.
+    pub signed: Option<Signed>,
+    /// `downgrade: true`: the owner's rollback. Only then may a version lower
+    /// than the running one be installed.
+    pub downgrade: bool,
+}
+
+/// A manifest as a job document carries it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Signed {
+    /// The exact bytes of `manifest.json`.
+    pub manifest: String,
+    /// `base64(DER(ECDSA-P256-SHA256(manifest)))`.
+    pub sig: String,
+    /// Which signing key made `sig`.
+    pub key_id: String,
 }
 
 impl FirmwareJob {
@@ -173,7 +209,7 @@ pub enum Outcome {
     Succeeded,
     /// Anything else.
     Failed {
-        /// Short, stable category; one of the `REASON_*` constants.
+        /// Short, stable category; one of the [`reason`] codes.
         reason: &'static str,
         /// What was observed, for a human.
         detail: String,
@@ -201,11 +237,11 @@ pub fn settle(pending: &PendingUpdate, boot: &BootFacts) -> Outcome {
         if !running_slot.is_empty() {
             detail.push_str(&format!(" and booted {running_slot}"));
         }
-        return failed(REASON_ROLLED_BACK, detail);
+        return failed(reason::ROLLBACK, detail);
     }
     if slots_known && running_slot != target_slot {
         return failed(
-            REASON_ROLLED_BACK,
+            reason::ROLLBACK,
             format!("booted {running_slot}, not {target_slot}"),
         );
     }
@@ -213,26 +249,23 @@ pub fn settle(pending: &PendingUpdate, boot: &BootFacts) -> Outcome {
     if !target.is_empty() && running != target {
         return if slots_known {
             failed(
-                REASON_VERSION_MISMATCH,
+                reason::VERSION,
                 format!("{running_slot} runs {running}, the job named {target}"),
             )
         } else {
-            failed(
-                REASON_ROLLED_BACK,
-                format!("running {running}, not {target}"),
-            )
+            failed(reason::ROLLBACK, format!("running {running}, not {target}"))
         };
     }
 
     if !slots_known && target.is_empty() {
         return failed(
-            REASON_UNCONFIRMED,
+            reason::BOOT,
             "no record of the slot or version the job installed".to_string(),
         );
     }
 
     if let Some(e) = &boot.valid_error {
-        return failed(REASON_NOT_VALID, e.clone());
+        return failed(reason::BOOT, e.clone());
     }
 
     Outcome::Succeeded
@@ -415,7 +448,9 @@ pub enum NextJob {
     Refused {
         /// Job id.
         job_id: String,
-        /// Why.
+        /// The [`reason`] code.
+        code: &'static str,
+        /// Why, for a human.
         reason: String,
     },
     /// A firmware update to download and install.
@@ -475,6 +510,7 @@ pub fn parse_next(payload: &[u8]) -> Result<NextJob, MalformedJob> {
     if url.is_empty() {
         return Ok(NextJob::Refused {
             job_id,
+            code: reason::JOB,
             reason: "the job document has no download_url".into(),
         });
     }
@@ -483,16 +519,144 @@ pub fn parse_next(payload: &[u8]) -> Result<NextJob, MalformedJob> {
     if !url.starts_with("https://") {
         return Ok(NextJob::Refused {
             job_id,
+            code: reason::JOB,
             reason: "download_url is not https".into(),
         });
     }
+
+    // Contract 1.1: a signed manifest. All three fields or none; a job that
+    // carries half of one is not quietly treated as unsigned.
+    let (manifest, sig, key_id) = (
+        text(&doc, "manifest"),
+        text(&doc, "sig"),
+        text(&doc, "key_id"),
+    );
+    let signed = match (manifest.is_empty(), sig.is_empty(), key_id.is_empty()) {
+        (true, true, true) => None,
+        (false, false, false) => Some(Signed {
+            manifest,
+            sig,
+            key_id,
+        }),
+        _ => {
+            return Ok(NextJob::Refused {
+                job_id,
+                code: reason::JOB,
+                reason: "the job carries part of a signed manifest".into(),
+            })
+        }
+    };
 
     Ok(NextJob::Install(FirmwareJob {
         job_id,
         url,
         target_version,
         product: text(&doc, "product"),
+        signed,
+        downgrade: doc.get("downgrade").and_then(Value::as_bool) == Some(true),
     }))
+}
+
+/// What this firmware is, for deciding whether to take a job.
+#[derive(Debug, Clone, Copy)]
+pub struct Policy<'a> {
+    /// This firmware's product.
+    pub product: &'a str,
+    /// The signing keys it accepts.
+    pub keyring: &'a Keyring,
+    /// Refuse jobs without a signed manifest (the `signed-only` feature,
+    /// Phase 6 of the platform plan).
+    pub signed_only: bool,
+}
+
+/// What to do with a firmware job, decided before anything is downloaded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Admission {
+    /// Download and install it; check the image against `expected` if the job
+    /// was signed.
+    Install { expected: Option<Expected> },
+    /// The job names the version already running: SUCCEEDED, nothing to do.
+    AlreadyRunning,
+    /// The device runs a greater version: SUCCEEDED `already-newer`.
+    AlreadyNewer,
+    /// Not for this device: REJECTED with the [`reason`] code.
+    Reject { code: &'static str, detail: String },
+    /// For this device, but not acceptable: FAILED with the [`reason`] code.
+    Fail { code: &'static str, detail: String },
+}
+
+/// Decides what to do with `job` (`PLATFORM.md` §5, Device OTA):
+///
+/// 1. A job for another product is rejected.
+/// 2. A signed manifest must verify against the keyring and name this
+///    product and the job's version; without one, a `signed-only` image
+///    refuses the job.
+/// 3. Only a greater version is installed, unless the job says `downgrade`.
+pub fn admit(job: &FirmwareJob, boot: &BootFacts, policy: &Policy<'_>) -> Admission {
+    if !job.product.is_empty() && job.product != policy.product {
+        return Admission::Reject {
+            code: reason::PRODUCT,
+            detail: format!(
+                "the image is for product {:?}, this device is {:?}",
+                job.product, policy.product
+            ),
+        };
+    }
+    let fail = |code, detail: String| Admission::Fail { code, detail };
+
+    let expected = match &job.signed {
+        Some(signed) => {
+            if let Err(e) =
+                policy
+                    .keyring
+                    .verify(&signed.key_id, signed.manifest.as_bytes(), &signed.sig)
+            {
+                return fail(reason::SIG, e);
+            }
+            let manifest = match Manifest::parse(signed.manifest.as_bytes()) {
+                Ok(m) => m,
+                Err(e) => return fail(reason::SIG, e),
+            };
+            if manifest.product != policy.product {
+                return fail(
+                    reason::SIG,
+                    format!("the manifest is for product {:?}", manifest.product),
+                );
+            }
+            if manifest.version != job.target_version {
+                return fail(
+                    reason::SIG,
+                    format!(
+                        "the manifest is for {}, the job names {:?}",
+                        manifest.version, job.target_version
+                    ),
+                );
+            }
+            Some(manifest.expected())
+        }
+        None if policy.signed_only => {
+            return fail(reason::SIG, "the job has no signed manifest".into());
+        }
+        None => None,
+    };
+
+    if is_already_running(job, boot) {
+        return Admission::AlreadyRunning;
+    }
+    if !job.target_version.is_empty() {
+        let target = match Version::parse(&job.target_version) {
+            Ok(v) => v,
+            Err(e) => return fail(reason::VERSION, e),
+        };
+        // A running version that does not parse (a local build, say) never
+        // blocks an update.
+        if let Ok(running) = Version::parse(&boot.running_version) {
+            if target <= running && !job.downgrade {
+                return Admission::AlreadyNewer;
+            }
+        }
+    }
+    Admission::Install { expected }
 }
 
 /// A `jobs/{jobId}/update/rejected` response.
@@ -622,12 +786,46 @@ pub fn rebooting(pending: &PendingUpdate) -> StatusUpdate {
     update
 }
 
-/// FAILED, when the image could not be downloaded, written or activated. The
-/// running image is still the boot image.
-pub fn install_failed(job: &FirmwareJob, error: &str) -> StatusUpdate {
+/// Why an install did not happen. The running image is still the boot image.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InstallError {
+    /// The image could not be downloaded or written: transient.
+    Download(String),
+    /// The image did not match its manifest, or failed the bootloader's own
+    /// image check.
+    Verify(String),
+    /// The step before activation failed (recording the job).
+    Activate(String),
+}
+
+impl InstallError {
+    /// The [`reason`] code it is reported with.
+    pub fn code(&self) -> &'static str {
+        match self {
+            InstallError::Verify(_) => reason::VERIFY,
+            InstallError::Download(_) | InstallError::Activate(_) => reason::DOWNLOAD,
+        }
+    }
+
+    pub fn detail(&self) -> &str {
+        match self {
+            InstallError::Download(d) | InstallError::Verify(d) | InstallError::Activate(d) => d,
+        }
+    }
+}
+
+impl fmt::Display for InstallError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}: {}", self.code(), self.detail())
+    }
+}
+
+/// FAILED, when the image could not be downloaded, verified, written or
+/// activated, or the job was refused before the download.
+pub fn install_failed(job: &FirmwareJob, code: &'static str, detail: &str) -> StatusUpdate {
     StatusUpdate::new("FAILED")
-        .detail("reason", REASON_INSTALL_FAILED)
-        .detail("detail", error)
+        .detail("reason", code)
+        .detail("detail", detail)
         .detail("target", &job.target_version)
 }
 
@@ -635,7 +833,7 @@ pub fn install_failed(job: &FirmwareJob, error: &str) -> StatusUpdate {
 /// ([`MAX_DOWNLOAD_ATTEMPTS`]).
 pub fn download_interrupted(job: &FirmwareJob, attempts: u32) -> StatusUpdate {
     StatusUpdate::new("FAILED")
-        .detail("reason", REASON_DOWNLOAD_INTERRUPTED)
+        .detail("reason", reason::DOWNLOAD)
         .detail(
             "detail",
             &format!("{attempts} downloads started and none finished; the device crashed or lost power during each"),
@@ -643,13 +841,22 @@ pub fn download_interrupted(job: &FirmwareJob, attempts: u32) -> StatusUpdate {
         .detail("target", &job.target_version)
 }
 
-/// REJECTED, for a firmware job this firmware will not run
-/// ([`NextJob::Refused`]). Left alone, it would stay QUEUED, and be offered
-/// again at every boot.
-pub fn refused(reason: &str) -> StatusUpdate {
+/// REJECTED, for a job this firmware will not run ([`NextJob::Refused`], an
+/// unknown operation, another product). Left alone, it would stay QUEUED, and
+/// be offered again at every boot.
+pub fn refused(code: &'static str, detail: &str) -> StatusUpdate {
     StatusUpdate::new("REJECTED")
-        .detail("reason", REASON_REFUSED)
-        .detail("detail", reason)
+        .detail("reason", code)
+        .detail("detail", detail)
+}
+
+/// SUCCEEDED without an install: the device runs a greater version.
+pub fn already_newer(job: &FirmwareJob, boot: &BootFacts) -> StatusUpdate {
+    StatusUpdate::new("SUCCEEDED")
+        .detail("reason", reason::ALREADY_NEWER)
+        .detail("target", &job.target_version)
+        .detail("running", normalize_version(&boot.running_version))
+        .detail("running_slot", &boot.running_slot)
 }
 
 /// SUCCEEDED, for a job [`is_already_running`] found nothing to do for.
@@ -779,7 +986,7 @@ mod tests {
         let mut boot = booted("0.1.0", "ota_0");
         boot.invalid_slot = Some("ota_1".into());
         let outcome = settle(&pending(), &boot);
-        assert_eq!(reason(&outcome), REASON_ROLLED_BACK);
+        assert_eq!(reason(&outcome), reason::ROLLBACK);
         let Outcome::Failed { detail, .. } = outcome else {
             unreachable!()
         };
@@ -789,7 +996,7 @@ mod tests {
     #[test]
     fn booting_the_other_slot_is_a_rollback_even_without_the_bootloader_saying_so() {
         let outcome = settle(&pending(), &booted("0.1.0", "ota_0"));
-        assert_eq!(reason(&outcome), REASON_ROLLED_BACK);
+        assert_eq!(reason(&outcome), reason::ROLLBACK);
     }
 
     // --- was_activated ----------------------------------------------------------
@@ -843,10 +1050,7 @@ mod tests {
     fn a_job_whose_downloads_never_finish_fails() {
         let update = download_interrupted(&job_for("firmware_v0.3.0"), 3);
         assert_eq!(update.status(), "FAILED");
-        assert_eq!(
-            update.detail_value("reason"),
-            Some(REASON_DOWNLOAD_INTERRUPTED)
-        );
+        assert_eq!(update.detail_value("reason"), Some(reason::DOWNLOAD));
         assert_eq!(update.detail_value("target"), Some("0.3.0"));
     }
 
@@ -894,9 +1098,9 @@ mod tests {
 
     #[test]
     fn a_refused_job_is_rejected_with_the_reason() {
-        let update = refused("download_url is not https");
+        let update = refused(reason::JOB, "download_url is not https");
         assert_eq!(update.status(), "REJECTED");
-        assert_eq!(update.detail_value("reason"), Some(REASON_REFUSED));
+        assert_eq!(update.detail_value("reason"), Some(reason::JOB));
         assert_eq!(
             update.detail_value("detail"),
             Some("download_url is not https")
@@ -909,7 +1113,7 @@ mod tests {
         let mut same = pending();
         same.target_version = "0.1.0".into();
         let outcome = settle(&same, &booted("0.1.0", "ota_0"));
-        assert_eq!(reason(&outcome), REASON_ROLLED_BACK);
+        assert_eq!(reason(&outcome), reason::ROLLBACK);
     }
 
     #[test]
@@ -922,7 +1126,7 @@ mod tests {
     #[test]
     fn the_wrong_version_in_the_right_slot_is_a_mismatch_not_a_rollback() {
         let outcome = settle(&pending(), &booted("0.1.9", "ota_1"));
-        assert_eq!(reason(&outcome), REASON_VERSION_MISMATCH);
+        assert_eq!(reason(&outcome), reason::VERSION);
     }
 
     #[test]
@@ -940,13 +1144,13 @@ mod tests {
         assert_eq!(settle(&pending(), &booted("0.2.0", "")), Outcome::Succeeded);
         assert_eq!(
             reason(&settle(&pending(), &booted("0.1.0", ""))),
-            REASON_ROLLED_BACK
+            reason::ROLLBACK
         );
         let mut unknown_slot = pending();
         unknown_slot.target_slot.clear();
         assert_eq!(
             reason(&settle(&unknown_slot, &booted("0.1.0", "ota_0"))),
-            REASON_ROLLED_BACK
+            reason::ROLLBACK
         );
     }
 
@@ -960,7 +1164,7 @@ mod tests {
         );
         assert_eq!(
             reason(&settle(&unversioned, &booted("0.1.0", "ota_0"))),
-            REASON_ROLLED_BACK
+            reason::ROLLBACK
         );
     }
 
@@ -971,7 +1175,7 @@ mod tests {
         blank.target_slot.clear();
         assert_eq!(
             reason(&settle(&blank, &booted("0.2.0", "ota_1"))),
-            REASON_UNCONFIRMED
+            reason::BOOT
         );
     }
 
@@ -980,14 +1184,14 @@ mod tests {
         let mut boot = booted("0.2.0", "ota_1");
         boot.valid_error = Some("ESP_ERR_OTA_ROLLBACK_FAILED".into());
         let outcome = settle(&pending(), &boot);
-        assert_eq!(reason(&outcome), REASON_NOT_VALID);
+        assert_eq!(reason(&outcome), reason::BOOT);
     }
 
     #[test]
     fn a_rollback_is_reported_as_such_even_if_marking_valid_failed() {
         let mut boot = booted("0.1.0", "ota_0");
         boot.valid_error = Some("whatever".into());
-        assert_eq!(reason(&settle(&pending(), &boot)), REASON_ROLLED_BACK);
+        assert_eq!(reason(&settle(&pending(), &boot)), reason::ROLLBACK);
     }
 
     // --- is_already_running -----------------------------------------------------
@@ -998,6 +1202,8 @@ mod tests {
             job_id: "j".into(),
             url: "https://x".into(),
             target_version: normalize_version(version).to_string(),
+            signed: None,
+            downgrade: false,
         }
     }
 
@@ -1120,7 +1326,7 @@ mod tests {
     }
 
     #[test]
-    fn other_operations_are_left_alone() {
+    fn other_operations_are_told_apart() {
         let payload = with_execution(|e| e["jobDocument"]["operation"] = "reboot".into());
         assert_eq!(
             parse_next(&payload),
@@ -1246,7 +1452,7 @@ mod tests {
         let outcome = settle(&pending(), &boot);
         let update = settled(&pending(), &boot, &outcome);
         assert_eq!(update.status(), "FAILED");
-        assert_eq!(update.detail_value("reason"), Some(REASON_ROLLED_BACK));
+        assert_eq!(update.detail_value("reason"), Some(reason::ROLLBACK));
         assert_eq!(update.detail_value("running"), Some("0.1.0"));
         assert_eq!(update.detail_value("target"), Some("0.2.0"));
         assert_eq!(update.detail_value("target_slot"), Some("ota_1"));
@@ -1260,9 +1466,11 @@ mod tests {
             job_id: "j".into(),
             url: "https://x".into(),
             target_version: String::new(),
+            signed: None,
+            downgrade: false,
         };
         let long = format!("line one\nline two\t{}", "x".repeat(300));
-        let update = install_failed(&job, &long);
+        let update = install_failed(&job, reason::DOWNLOAD, &long);
         let detail = update.detail_value("detail").unwrap();
         assert!(detail.len() <= MAX_DETAIL_CHARS);
         assert!(detail.chars().all(|c| c.is_ascii_graphic() || c == ' '));
@@ -1284,5 +1492,216 @@ mod tests {
         assert!(back.is_well_formed());
         let bad: PendingUpdate = serde_json::from_str(r#"{"job_id":"a#"}"#).unwrap();
         assert!(!bad.is_well_formed());
+    }
+
+    // --- contract 1.1: signed manifests, monotonic versions ------------------
+
+    mod v1_1 {
+        use super::*;
+        use base64::Engine as _;
+        use p256::ecdsa::signature::Signer;
+        use p256::ecdsa::{Signature, SigningKey};
+        use p256::pkcs8::{EncodePublicKey, LineEnding};
+
+        fn key() -> SigningKey {
+            SigningKey::from_slice(&[3u8; 32]).unwrap()
+        }
+
+        fn keyring() -> Keyring {
+            let pem = key()
+                .verifying_key()
+                .to_public_key_pem(LineEnding::LF)
+                .unwrap();
+            Keyring::from_pems([("vaktus-a", pem.as_str())]).unwrap()
+        }
+
+        fn manifest(product: &str, version: &str) -> Manifest {
+            Manifest {
+                contract: 1,
+                product: product.into(),
+                version: version.into(),
+                sha256: [1u8; 32],
+                size: 100,
+                factory_sha256: "cd".repeat(32),
+            }
+        }
+
+        fn signed(m: &Manifest) -> Signed {
+            let bytes = m.to_bytes();
+            let sig: Signature = key().sign(&bytes);
+            Signed {
+                manifest: String::from_utf8(bytes).unwrap(),
+                sig: base64::engine::general_purpose::STANDARD.encode(sig.to_der().as_bytes()),
+                key_id: "vaktus-a".into(),
+            }
+        }
+
+        fn job(version: &str, signed: Option<Signed>) -> FirmwareJob {
+            FirmwareJob {
+                job_id: "ota-vaktus-0_9_0-c".into(),
+                url: "https://example.cloudfront.net/x".into(),
+                target_version: version.into(),
+                product: "vaktus".into(),
+                signed,
+                downgrade: false,
+            }
+        }
+
+        fn admit_on(job: &FirmwareJob, running: &str, signed_only: bool) -> Admission {
+            let ring = keyring();
+            admit(
+                job,
+                &booted(running, "ota_0"),
+                &Policy {
+                    product: "vaktus",
+                    keyring: &ring,
+                    signed_only,
+                },
+            )
+        }
+
+        fn code(a: &Admission) -> &'static str {
+            match a {
+                Admission::Reject { code, .. } | Admission::Fail { code, .. } => code,
+                other => panic!("not a refusal: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn a_signed_newer_version_is_installed_with_its_digest() {
+            let m = manifest("vaktus", "0.9.0");
+            let a = admit_on(&job("0.9.0", Some(signed(&m))), "0.8.0", true);
+            assert_eq!(
+                a,
+                Admission::Install {
+                    expected: Some(m.expected())
+                }
+            );
+        }
+
+        #[test]
+        fn an_unsigned_job_is_installed_until_signed_only() {
+            assert_eq!(
+                admit_on(&job("0.9.0", None), "0.8.0", false),
+                Admission::Install { expected: None }
+            );
+            assert_eq!(
+                code(&admit_on(&job("0.9.0", None), "0.8.0", true)),
+                reason::SIG
+            );
+        }
+
+        #[test]
+        fn versions_only_go_up_unless_downgrade() {
+            assert_eq!(
+                admit_on(&job("0.8.0", None), "0.8.0", false),
+                Admission::AlreadyRunning
+            );
+            assert_eq!(
+                admit_on(&job("0.7.0", None), "0.8.0", false),
+                Admission::AlreadyNewer
+            );
+            assert_eq!(
+                admit_on(&job("0.9.0-rc.1", None), "0.9.0", false),
+                Admission::AlreadyNewer
+            );
+            let mut rollback = job("0.7.0", None);
+            rollback.downgrade = true;
+            assert_eq!(
+                admit_on(&rollback, "0.8.0", false),
+                Admission::Install { expected: None }
+            );
+            // A local build that is not semver never blocks an update.
+            assert_eq!(
+                admit_on(&job("0.7.0", None), "dev", false),
+                Admission::Install { expected: None }
+            );
+            assert_eq!(
+                code(&admit_on(&job("latest", None), "0.8.0", false)),
+                reason::VERSION
+            );
+        }
+
+        #[test]
+        fn the_manifest_must_bind_this_product_and_the_jobs_version() {
+            let other_version = signed(&manifest("vaktus", "0.9.1"));
+            assert_eq!(
+                code(&admit_on(
+                    &job("0.9.0", Some(other_version)),
+                    "0.8.0",
+                    false
+                )),
+                reason::SIG
+            );
+            let other_product = signed(&manifest("gateway", "0.9.0"));
+            assert_eq!(
+                code(&admit_on(
+                    &job("0.9.0", Some(other_product)),
+                    "0.8.0",
+                    false
+                )),
+                reason::SIG
+            );
+        }
+
+        #[test]
+        fn a_bad_signature_fails_the_job() {
+            let mut s = signed(&manifest("vaktus", "0.9.0"));
+            s.manifest = s.manifest.replace("\"size\":100", "\"size\":101");
+            assert_eq!(
+                code(&admit_on(&job("0.9.0", Some(s)), "0.8.0", false)),
+                reason::SIG
+            );
+            let mut unknown = signed(&manifest("vaktus", "0.9.0"));
+            unknown.key_id = "vaktus-z".into();
+            assert_eq!(
+                code(&admit_on(&job("0.9.0", Some(unknown)), "0.8.0", false)),
+                reason::SIG
+            );
+        }
+
+        #[test]
+        fn another_products_job_is_rejected_first() {
+            let mut j = job("0.9.0", None);
+            j.product = "gateway".into();
+            assert_eq!(code(&admit_on(&j, "0.8.0", true)), reason::PRODUCT);
+        }
+
+        #[test]
+        fn job_documents_carry_the_manifest() {
+            let s = signed(&manifest("vaktus", "0.9.0"));
+            let payload = with_execution(|e| {
+                let doc = &mut e["jobDocument"];
+                doc["contract"] = 1.into();
+                doc["manifest"] = s.manifest.clone().into();
+                doc["sig"] = s.sig.clone().into();
+                doc["key_id"] = s.key_id.clone().into();
+                doc["downgrade"] = true.into();
+            });
+            let Ok(NextJob::Install(j)) = parse_next(&payload) else {
+                panic!("not an install");
+            };
+            assert_eq!(j.signed, Some(s));
+            assert!(j.downgrade);
+
+            let half = with_execution(|e| e["jobDocument"]["sig"] = "AAAA".into());
+            assert!(matches!(
+                parse_next(&half),
+                Ok(NextJob::Refused {
+                    code: reason::JOB,
+                    ..
+                })
+            ));
+        }
+
+        #[test]
+        fn install_errors_map_to_reason_codes() {
+            assert_eq!(InstallError::Verify("x".into()).code(), reason::VERIFY);
+            assert_eq!(InstallError::Download("x".into()).code(), reason::DOWNLOAD);
+            assert_eq!(InstallError::Activate("x".into()).code(), reason::DOWNLOAD);
+            let u = already_newer(&job("0.7.0", None), &booted("0.8.0", "ota_1"));
+            assert_eq!(u.status(), "SUCCEEDED");
+            assert_eq!(u.detail_value("reason"), Some(reason::ALREADY_NEWER));
+        }
     }
 }

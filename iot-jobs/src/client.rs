@@ -20,7 +20,8 @@
 use std::time::{Duration, Instant};
 
 use super::{
-    self as jobs, BootFacts, DownloadAttempts, FirmwareJob, NextJob, Outcome, PendingUpdate,
+    self as jobs, Admission, BootFacts, DownloadAttempts, Expected, FirmwareJob, InstallError,
+    Keyring, NextJob, Outcome, PendingUpdate, Policy, StatusUpdate,
 };
 
 /// How long an outcome may go unacknowledged before it is sent again.
@@ -67,14 +68,27 @@ pub trait Store {
 
 /// Writes an image to the next OTA slot.
 pub trait Installer {
-    /// Downloads `url`, writes and verifies it, calls `before_activate` with
-    /// the slot's label, and only if that succeeds makes the slot the boot
-    /// slot. Returns the label. Does not restart.
+    /// Downloads `url`, writes and verifies it (against `expected`, when the
+    /// job was signed: every byte hashed as it streams in, and the size),
+    /// calls `before_activate` with the slot's label, and only if that
+    /// succeeds makes the slot the boot slot. Returns the label. Does not
+    /// restart. A `before_activate` failure is [`InstallError::Activate`].
     fn install(
         &mut self,
         url: &str,
+        expected: Option<&Expected>,
         before_activate: &mut dyn FnMut(&str) -> Result<(), String>,
-    ) -> Result<String, String>;
+    ) -> Result<String, InstallError>;
+}
+
+/// A job outcome the Jobs service has acknowledged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Settled {
+    pub job_id: String,
+    /// `SUCCEEDED`, `FAILED` or `REJECTED`.
+    pub status: &'static str,
+    /// The [`jobs::reason`] code, if any.
+    pub reason: String,
 }
 
 /// What the caller does after [`JobsClient::handle`].
@@ -108,11 +122,19 @@ pub struct JobsClient<S, I> {
     /// The platform product this firmware is, if set with
     /// [`Self::with_product`].
     product: Option<String>,
+    /// Keys that may sign manifests ([`Self::with_keyring`]).
+    keyring: Keyring,
+    /// Refuse unsigned jobs ([`Self::signed_only`]).
+    signed_only: bool,
+    /// The last outcome the service acknowledged, until taken.
+    settled: Option<Settled>,
 }
 
 /// A job outcome on its way to the Jobs service.
 struct Settling {
     job_id: String,
+    status: &'static str,
+    reason: String,
     update: String,
     accepted: String,
     rejected: String,
@@ -159,6 +181,9 @@ impl<S: Store, I: Installer> JobsClient<S, I> {
             settling: None,
             dropped: Vec::new(),
             product: None,
+            keyring: Keyring::default(),
+            signed_only: false,
+            settled: None,
         };
         if let Some(pending) = client.store.load() {
             if jobs::was_activated(&pending, &client.boot) {
@@ -193,6 +218,23 @@ impl<S: Store, I: Installer> JobsClient<S, I> {
         self
     }
 
+    /// The keys a signed manifest may be signed with.
+    pub fn with_keyring(mut self, keyring: Keyring) -> Self {
+        self.keyring = keyring;
+        self
+    }
+
+    /// Refuses (FAILED `sig`) every job without a signed manifest.
+    pub fn signed_only(mut self, on: bool) -> Self {
+        self.signed_only = on;
+        self
+    }
+
+    /// The outcome the Jobs service acknowledged most recently, once.
+    pub fn take_settled(&mut self) -> Option<Settled> {
+        self.settled.take()
+    }
+
     /// Subscribes, then reports the outcome still owed, or else asks for any
     /// job that is already queued. Safe to call again after a reconnect.
     pub fn start(&mut self, client: &mut impl Transport) -> Result<(), String> {
@@ -204,11 +246,6 @@ impl<S: Store, I: Installer> JobsClient<S, I> {
         }
         client.publish(&self.next_get, b"{}")?;
         Ok(())
-    }
-
-    /// True when `product` is named and is not this firmware's product.
-    fn is_other_product(&self, product: &str) -> bool {
-        matches!(&self.product, Some(own) if !product.is_empty() && product != own)
     }
 
     /// Sends an outcome again if the Jobs service has not acknowledged it by
@@ -244,6 +281,11 @@ impl<S: Store, I: Installer> JobsClient<S, I> {
         if let Some(settling) = &self.settling {
             if topic == settling.accepted {
                 log::info!("OTA job {}: outcome recorded", settling.job_id);
+                self.settled = Some(Settled {
+                    job_id: settling.job_id.clone(),
+                    status: settling.status,
+                    reason: settling.reason.clone(),
+                });
                 self.finish_settling(client);
             } else if topic == settling.rejected {
                 let rejection = jobs::parse_rejection(payload);
@@ -285,23 +327,12 @@ impl<S: Store, I: Installer> JobsClient<S, I> {
             return Next::Continue;
         }
 
-        let next = match jobs::parse_next(payload) {
-            Ok(NextJob::Install(job)) if self.is_other_product(&job.product) => {
-                Ok(NextJob::Refused {
-                    reason: format!(
-                        "the image is for product {:?}, this device is {:?}",
-                        job.product,
-                        self.product.as_deref().unwrap_or_default()
-                    ),
-                    job_id: job.job_id,
-                })
-            }
-            other => other,
-        };
+        let next = jobs::parse_next(payload);
         if let Ok(
             NextJob::Install(FirmwareJob { job_id, .. })
             | NextJob::Settle(PendingUpdate { job_id, .. })
-            | NextJob::Refused { job_id, .. },
+            | NextJob::Refused { job_id, .. }
+            | NextJob::Unsupported { job_id, .. },
         ) = &next
         {
             if self.dropped.contains(job_id) {
@@ -314,49 +345,25 @@ impl<S: Store, I: Installer> JobsClient<S, I> {
         match next {
             Ok(NextJob::Idle) => Next::Continue,
             Ok(NextJob::Unsupported { job_id, operation }) => {
-                log::info!("ignoring job {job_id}: unsupported operation {operation:?}");
+                // Left QUEUED, it would block every job queued behind it.
+                log::warn!("job {job_id}: unsupported operation {operation:?}; reporting REJECTED");
+                let detail = format!("unsupported operation {operation:?}");
+                self.report(&job_id, &jobs::refused(jobs::reason::OPERATION, &detail));
+                self.send_report(client);
                 Next::Continue
             }
-            Ok(NextJob::Refused { job_id, reason }) => {
+            Ok(NextJob::Refused {
+                job_id,
+                code,
+                reason,
+            }) => {
                 // Left QUEUED, it would be offered again at every boot.
                 log::error!("refusing OTA job {job_id}: {reason}; reporting REJECTED");
-                self.report(&job_id, jobs::refused(&reason).encode());
+                self.report(&job_id, &jobs::refused(code, &reason));
                 self.send_report(client);
                 Next::Continue
             }
-            Ok(NextJob::Install(job)) if jobs::is_already_running(&job, &self.boot) => {
-                log::info!(
-                    "OTA job {}: {} is already running; reporting SUCCEEDED without a download",
-                    job.job_id,
-                    self.boot.running_version
-                );
-                self.report(&job.job_id, jobs::already_running(&self.boot).encode());
-                self.send_report(client);
-                Next::Continue
-            }
-            Ok(NextJob::Install(job)) => {
-                match jobs::next_attempt(self.store.load_attempts().as_ref(), &job.job_id) {
-                    Some(attempt) => {
-                        if let Err(e) = self.store.save_attempts(&attempt) {
-                            // Uncounted, a crashing download repeats until the
-                            // job times out, as it did before there was a count.
-                            log::warn!("{e}");
-                        }
-                        self.run_update(&job, attempt.count, client)
-                    }
-                    None => {
-                        log::error!(
-                            "OTA job {}: {} downloads started and none finished; reporting FAILED",
-                            job.job_id,
-                            jobs::MAX_DOWNLOAD_ATTEMPTS
-                        );
-                        let update = jobs::download_interrupted(&job, jobs::MAX_DOWNLOAD_ATTEMPTS);
-                        self.report(&job.job_id, update.encode());
-                        self.send_report(client);
-                        Next::Continue
-                    }
-                }
-            }
+            Ok(NextJob::Install(job)) => self.take_job(job, client),
             Ok(NextJob::Settle(pending)) => {
                 // Installed and rebooted for, but not in NVS: the record was
                 // lost. The status details the reboot left behind stand in.
@@ -370,6 +377,76 @@ impl<S: Store, I: Installer> JobsClient<S, I> {
             }
             Err(e) => {
                 log::warn!("unusable job description: {e}");
+                Next::Continue
+            }
+        }
+    }
+
+    /// Decides on a firmware job ([`jobs::admit`]) and runs it if admitted.
+    fn take_job(&mut self, job: FirmwareJob, client: &mut impl Transport) -> Next {
+        let product = self.product.clone().unwrap_or_else(|| job.product.clone());
+        let policy = Policy {
+            product: &product,
+            keyring: &self.keyring,
+            signed_only: self.signed_only,
+        };
+        let expected = match jobs::admit(&job, &self.boot, &policy) {
+            Admission::Install { expected } => expected,
+            Admission::AlreadyRunning => {
+                log::info!(
+                    "OTA job {}: {} is already running; reporting SUCCEEDED without a download",
+                    job.job_id,
+                    self.boot.running_version
+                );
+                self.report(&job.job_id, &jobs::already_running(&self.boot));
+                self.send_report(client);
+                return Next::Continue;
+            }
+            Admission::AlreadyNewer => {
+                log::info!(
+                    "OTA job {}: {:?} is not newer than the running {}; reporting SUCCEEDED without a download",
+                    job.job_id,
+                    job.target_version,
+                    self.boot.running_version
+                );
+                self.report(&job.job_id, &jobs::already_newer(&job, &self.boot));
+                self.send_report(client);
+                return Next::Continue;
+            }
+            Admission::Reject { code, detail } => {
+                log::error!(
+                    "refusing OTA job {}: {detail}; reporting REJECTED",
+                    job.job_id
+                );
+                self.report(&job.job_id, &jobs::refused(code, &detail));
+                self.send_report(client);
+                return Next::Continue;
+            }
+            Admission::Fail { code, detail } => {
+                log::error!("OTA job {}: {code}: {detail}; reporting FAILED", job.job_id);
+                self.report(&job.job_id, &jobs::install_failed(&job, code, &detail));
+                self.send_report(client);
+                return Next::Continue;
+            }
+        };
+        match jobs::next_attempt(self.store.load_attempts().as_ref(), &job.job_id) {
+            Some(attempt) => {
+                if let Err(e) = self.store.save_attempts(&attempt) {
+                    // Uncounted, a crashing download repeats until the job
+                    // times out, as it did before there was a count.
+                    log::warn!("{e}");
+                }
+                self.run_update(&job, expected, attempt.count, client)
+            }
+            None => {
+                log::error!(
+                    "OTA job {}: {} downloads started and none finished; reporting FAILED",
+                    job.job_id,
+                    jobs::MAX_DOWNLOAD_ATTEMPTS
+                );
+                let update = jobs::download_interrupted(&job, jobs::MAX_DOWNLOAD_ATTEMPTS);
+                self.report(&job.job_id, &update);
+                self.send_report(client);
                 Next::Continue
             }
         }
@@ -390,16 +467,22 @@ impl<S: Store, I: Installer> JobsClient<S, I> {
                 pending.job_id
             ),
         }
-        let payload = jobs::settled(&pending, &self.boot, &outcome).encode();
-        self.report(&pending.job_id, payload);
+        let update = jobs::settled(&pending, &self.boot, &outcome);
+        self.report(&pending.job_id, &update);
     }
 
     /// Queues a terminal status for `job_id`; nothing else is taken on until
     /// the Jobs service has answered it.
-    fn report(&mut self, job_id: &str, payload: Vec<u8>) {
+    fn report(&mut self, job_id: &str, status: &StatusUpdate) {
         let update = self.update_topic(job_id);
+        let payload = status.encode();
         self.settling = Some(Settling {
             job_id: job_id.to_string(),
+            status: status.status(),
+            reason: status
+                .detail_value("reason")
+                .unwrap_or_default()
+                .to_string(),
             accepted: format!("{update}/accepted"),
             rejected: format!("{update}/rejected"),
             update,
@@ -451,7 +534,13 @@ impl<S: Store, I: Installer> JobsClient<S, I> {
         format!("{}{job_id}/update", self.prefix)
     }
 
-    fn run_update(&mut self, job: &FirmwareJob, attempt: u32, client: &mut impl Transport) -> Next {
+    fn run_update(
+        &mut self,
+        job: &FirmwareJob,
+        expected: Option<Expected>,
+        attempt: u32,
+        client: &mut impl Transport,
+    ) -> Next {
         let update_topic = self.update_topic(job.job_id.as_str());
         let describe = Describe::new(&self.prefix, &job.job_id);
         log::info!(
@@ -472,16 +561,18 @@ impl<S: Store, I: Installer> JobsClient<S, I> {
         let store = &self.store;
         let from = self.boot.running_version.as_str();
         let mut unwanted = None;
-        let installed = self.installer.install(&job.url, &mut |slot| {
-            // The download blocked every message for its whole length; a
-            // cancellation sent meanwhile is only heard now.
-            if let Err(why) = describe.still_wanted(client) {
-                unwanted = Some(why.clone());
-                return Err(why);
-            }
-            // Before activation, so the new image never boots without it.
-            store.save(&job.pending(from, slot))
-        });
+        let installed = self
+            .installer
+            .install(&job.url, expected.as_ref(), &mut |slot| {
+                // The download blocked every message for its whole length; a
+                // cancellation sent meanwhile is only heard now.
+                if let Err(why) = describe.still_wanted(client) {
+                    unwanted = Some(why.clone());
+                    return Err(why);
+                }
+                // Before activation, so the new image never boots without it.
+                store.save(&job.pending(from, slot))
+            });
         describe.unsubscribe(client);
 
         match installed {
@@ -506,7 +597,9 @@ impl<S: Store, I: Installer> JobsClient<S, I> {
                     let _ = client.publish(&self.next_get, b"{}");
                 } else {
                     log::error!("OTA failed: {e}");
-                    let _ = client.publish(&update_topic, &jobs::install_failed(job, &e).encode());
+                    let update = jobs::install_failed(job, e.code(), e.detail());
+                    self.report(&job.job_id, &update);
+                    self.send_report(client);
                 }
                 Next::Continue
             }
@@ -708,13 +801,14 @@ mod tests {
         fn install(
             &mut self,
             _url: &str,
+            _expected: Option<&Expected>,
             before_activate: &mut dyn FnMut(&str) -> Result<(), String>,
-        ) -> Result<String, String> {
+        ) -> Result<String, InstallError> {
             self.installs += 1;
             if let Some(e) = &self.fail {
-                return Err(e.clone());
+                return Err(InstallError::Download(e.clone()));
             }
-            before_activate("ota_1")?;
+            before_activate("ota_1").map_err(InstallError::Activate)?;
             self.activated = true;
             Ok("ota_1".into())
         }
@@ -963,7 +1057,7 @@ mod tests {
         assert_eq!(updates[0]["status"], "FAILED");
         assert_eq!(
             updates[0]["statusDetails"]["reason"],
-            jobs::REASON_ROLLED_BACK
+            jobs::reason::ROLLBACK
         );
     }
 
@@ -1080,7 +1174,7 @@ mod tests {
         assert_eq!(updates.last().unwrap()["status"], "FAILED");
         assert_eq!(
             updates.last().unwrap()["statusDetails"]["reason"],
-            jobs::REASON_INSTALL_FAILED
+            jobs::reason::DOWNLOAD
         );
         assert_eq!(client.store.load(), None);
         assert_eq!(client.store.load_attempts(), None);
@@ -1110,7 +1204,7 @@ mod tests {
         assert_eq!(updates[0]["status"], "FAILED");
         assert_eq!(
             updates[0]["statusDetails"]["reason"],
-            jobs::REASON_DOWNLOAD_INTERRUPTED
+            jobs::reason::DOWNLOAD
         );
 
         // Once that is on record, the count goes and the next job runs.
@@ -1213,14 +1307,33 @@ mod tests {
     }
 
     #[test]
-    fn other_operations_are_left_alone() {
+    fn other_operations_are_rejected_so_they_do_not_block_the_queue() {
         let mut client = idle_client();
         let mut wire = Wire::default();
-        let reboot = offer("reboot-1", |e| {
-            e["jobDocument"]["operation"] = "reboot".into()
-        });
+        let reboot = offer(JOB, |e| e["jobDocument"]["operation"] = "reboot".into());
         deliver(&mut client, &mut wire, "$next/get/accepted", &reboot);
-        assert!(wire.published.is_empty());
+        let updates = wire.updates();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0]["status"], "REJECTED");
+        assert_eq!(
+            updates[0]["statusDetails"]["reason"],
+            jobs::reason::OPERATION
+        );
+        deliver(
+            &mut client,
+            &mut wire,
+            &format!("{JOB}/update/accepted"),
+            b"{}",
+        );
+        assert_eq!(
+            client.take_settled(),
+            Some(Settled {
+                job_id: JOB.into(),
+                status: "REJECTED",
+                reason: jobs::reason::OPERATION.into(),
+            })
+        );
+        assert_eq!(client.take_settled(), None);
     }
 
     #[test]
