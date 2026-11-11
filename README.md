@@ -18,6 +18,7 @@ owner's bench tool. Products today:
 | [`nvs-image`](nvs-image) | reads an ESP-IDF NVS partition dump | host |
 | [`ergo`](ergo) | the owner's CLI: `register`, `commission`, `nvs-check` | host |
 | [`contract/v1`](contract/v1) | the signed-manifest test vector, made with `openssl` | — |
+| [`firmware-release.yml`](.github/workflows/firmware-release.yml) | every product's release pipeline (reusable workflow) | GitHub Actions |
 
 ## What every product gets
 
@@ -111,6 +112,44 @@ The `atecc608` feature needs the product to declare CryptoAuthLib with
 `bindings_module = "atca"` and link with `-Wl,--wrap=atcab_release` (see
 `device-sdk/src/atecc.rs` and the Vaktus repository).
 
+## Releasing
+
+Every merge to a product's `main` runs [`firmware-release.yml`](.github/workflows/firmware-release.yml). The product's `release.yml` only calls it, pinned by commit SHA:
+
+```yaml
+on:
+  push:
+    branches: [ main ]
+concurrency:
+  group: release-${{ github.repository }}
+  cancel-in-progress: false
+permissions: {}
+jobs:
+  release:
+    uses: ergousha/iot-device-sdk/.github/workflows/firmware-release.yml@<sha> # <branch or tag>
+    permissions:
+      contents: write   # tag and GitHub pre-release
+      id-token: write   # AWS OIDC, in the publish job only
+      issues: write     # "release vX.Y.Z failed"
+    with:
+      flash-size: 4mb
+      aws-role-arn: ${{ vars.AWS_ROLE_ARN }}
+      firmware-bucket: ${{ vars.AWS_FIRMWARE_BUCKET }}
+```
+
+1. **version**: the next semver from the conventional commits since the newest `v*` tag (`feat` → minor, `fix` → patch, breaking → major, or minor below 1.0). Without a `feat:` or `fix:` nothing is released.
+2. **build**, with no secrets, no AWS and no cache: `app.bin` (the OTA image), `factory.bin` (bootloader, partition table and app, for a first flash), the canonical `manifest.json` and a CycloneDX SBOM. The app must fit 90 % of an OTA slot. Both images are scanned: PEM blocks other than the Amazon root CA and `keys/*.pub.pem` fail the build, and so does any string listed in the `image-scan-forbidden` input.
+3. **publish**, in Environment `release`: re-hash against the manifest, sign it with `FIRMWARE_SIGNING_KEY` (the key touches one 0600 file, shredded afterwards), check that the signature verifies with one of `keys/*.pub.pem`, tag `vX.Y.Z` and create a GitHub pre-release with the assets, then upload to `s3://<bucket>/releases/<product>/<X.Y.Z>/` with `If-None-Match: *`, `manifest.sig` last. The product's AWS role trusts only this workflow, in that Environment, for 15 minutes.
+4. **notify**: on failure, an issue "release vX.Y.Z failed" (email and mobile push).
+
+From there the platform's OTA controller verifies the signature again, runs the release on the canaries, soaks it and promotes it (iot-platform README §3).
+
+### Signing keys
+
+`scripts/signing-keys.sh <product checkout>` creates a product's keys once: `<id>-a` (active) and `<id>-b` (backup), both public keys in `keys/` and `platform.toml` (every image accepts both) and in SSM `/iot-platform/products/<id>/signing_keys`, the Environment `release` (main only) with `<id>-a` as its secret, and `<id>-b` to the clipboard for the password manager. No private key is written to disk. Rotating to the backup is a `gh secret set`; no Terraform.
+
+Until a unit runs an image that has the keys, the controller sends it unsigned (v1) job documents, after checking the signature itself; from then on, signed ones. The `signed-only` feature (plan Phase 6) refuses anything unsigned.
+
 ## Commissioning a device
 
 At the bench, with the board on USB and the owner's AWS session:
@@ -121,8 +160,9 @@ cargo run -p ergo -- commission --product vaktus --port /dev/cu.usbserial-110 \
 ```
 
 `ergo` reads the MAC and public key off the console, registers them, writes
-the claim and WiFi, activates the claim for the window only, and waits for the
-enrolment; on any failure it disarms the claim, removes the record and wipes
+the claim (SSM `/iot-platform/claim/{cert,key}`, which the platform's OTA
+controller rotates) and WiFi, activates the claim for the window only, and
+waits for the enrolment; on any failure it disarms the claim, removes the record and wipes
 what it wrote. `--reprovision` re-enrols an enrolled board (it forgets its
 identity first). `ergo nvs-check --dump <file> --product <id>` shows what the
 SDK will read from a dump of a board's `nvs` partition, never key material.

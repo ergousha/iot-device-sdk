@@ -1,0 +1,455 @@
+name: Firmware release
+
+# The release pipeline of every product on the platform (plan §5b). A
+# product's release.yml calls it on each push to main, pinned by commit SHA:
+#
+#   on: { push: { branches: [main] } }
+#   concurrency: { group: release-${{ github.repository }}, cancel-in-progress: false }
+#   permissions: {}
+#   jobs:
+#     release:
+#       uses: ergousha/iot-device-sdk/.github/workflows/firmware-release.yml@<sha> # vX.Y.Z
+#       permissions: { contents: write, id-token: write, issues: write }
+#       with:
+#         flash-size: 4mb
+#         aws-role-arn: ${{ vars.AWS_ROLE_ARN }}
+#         firmware-bucket: ${{ vars.AWS_FIRMWARE_BUCKET }}
+#
+# 1. version  next semver from the conventional commits since the last v* tag;
+#             nothing to do without a feat: or fix:.
+# 2. build    no secrets, no AWS, no cache: app.bin (the OTA image),
+#             factory.bin (bootloader + partition table + app, first flash),
+#             manifest.json, a CycloneDX SBOM. Slot usage and an image scan
+#             are checked. The artifact is public and secret-free.
+# 3. publish  Environment `release` (protected main; its secret is the
+#             signing key): sign the manifest, tag and pre-release on GitHub,
+#             then upload to releases/<product>/<X.Y.Z>/ through the product's
+#             OIDC role, which trusts only this workflow in that Environment.
+#             manifest.sig goes last: its S3 event starts the OTA controller.
+# 4. notify   on failure, an issue "release vX.Y.Z failed" (email + push).
+#
+# The OTA controller (iot-platform) verifies the signature again, and so does
+# the device.
+
+on:
+  workflow_call:
+    inputs:
+      flash-size:
+        description: Flash size for espflash (4mb, 16mb, ...).
+        type: string
+        required: true
+      aws-role-arn:
+        description: The product's GitHub OIDC role (iot-platform output github_actions_role_arns).
+        type: string
+        required: true
+      firmware-bucket:
+        description: The platform's firmware bucket (iot-platform output firmware_bucket_name).
+        type: string
+        required: true
+      aws-region:
+        type: string
+        default: eu-central-1
+      max-slot-percent:
+        description: Fail when the app takes more than this share of an OTA slot.
+        type: number
+        default: 90
+      image-scan-forbidden:
+        description: Newline-separated strings an image must not contain (the owner's SSID, say). Not secrets.
+        type: string
+        default: ""
+
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: "2"
+  CMAKE_BUILD_PARALLEL_LEVEL: "2"
+  ESPFLASH_VERSION: "4.5.0"
+  ESPFLASH_SHA256: "9408208ee3d2408cd1247da61bf6e85e7611d4380c590b85e61070fe7e2bb069"
+  CYCLONEDX_VERSION: "0.5.9"
+  CYCLONEDX_SHA256: "fb8dbee9f182173e062a64a387b21a0badc6fab8b2abf9294973f012972bf6d8"
+
+jobs:
+  version:
+    name: Version
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.next.outputs.version }}
+      product: ${{ steps.platform.outputs.product }}
+      chip: ${{ steps.platform.outputs.chip }}
+      partitions: ${{ steps.platform.outputs.partitions }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 0 # every commit and tag since the last release
+          persist-credentials: false
+
+      - name: Read platform.toml
+        id: platform
+        shell: python3 {0}
+        run: |
+          import os, re, tomllib
+          with open("platform.toml", "rb") as f:
+              p = tomllib.load(f)
+          product, chip = p["product"]["id"], p["product"]["chip"]
+          partitions = p.get("flash", {}).get("partitions", "partitions.csv")
+          assert re.fullmatch(r"[a-z][a-z0-9]{1,15}", product), product
+          assert re.fullmatch(r"esp32[a-z0-9]*", chip), chip
+          assert re.fullmatch(r"[A-Za-z0-9_./-]+\.csv", partitions) and ".." not in partitions, partitions
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"product={product}\nchip={chip}\npartitions={partitions}\n")
+
+      # Next semver since the newest v* tag: feat -> minor, fix -> patch, a
+      # breaking feat/fix (`!` or BREAKING CHANGE) -> major, or minor below
+      # 1.0. Nothing else releases. Merge commits are skipped; the commits
+      # they bring in count.
+      - name: Next version
+        id: next
+        shell: python3 {0}
+        run: |
+          import os, re, subprocess
+
+          def git(*args):
+              return subprocess.run(["git", *args], check=True, capture_output=True, text=True).stdout
+
+          semver = re.compile(r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)")
+          def versions(tags):
+              return sorted((tuple(map(int, m.groups())), t) for t in tags.split() if (m := semver.fullmatch(t)))
+
+          # The base is the highest tag anywhere (a tag made on a branch still
+          # takes its number); the commits are those since the highest tag on main.
+          every, merged = versions(git("tag", "--list", "v*")), versions(git("tag", "--merged", "HEAD", "--list", "v*"))
+          base = every[-1][0] if every else (0, 0, 0)
+          span = [f"{merged[-1][1]}..HEAD"] if merged else ["HEAD"]
+
+          header = re.compile(r"(?P<type>[a-z]+)(?:\([^()\r\n]*\))?(?P<bang>!)?: (?P<desc>.+)")
+          bump, notes = 0, {"feat": [], "fix": []}
+          for entry in git("log", "--no-merges", "--format=%h%x1f%s%x1f%b%x1e", *span).split("\x1e"):
+              if not entry.strip():
+                  continue
+              sha, subject, body = (entry.strip("\n").split("\x1f") + ["", ""])[:3]
+              m = header.fullmatch(subject.strip())
+              if not m or m["type"] not in notes:
+                  continue
+              breaking = bool(m["bang"]) or re.search(r"^BREAKING[ -]CHANGE: ", body, re.M) is not None
+              bump = max(bump, 3 if breaking else 2 if m["type"] == "feat" else 1)
+              notes[m["type"]].append(f"- {m['desc']} ({sha})" + (" **breaking**" if breaking else ""))
+
+          major, minor, patch = base
+          if bump == 3 and major == 0:
+              bump = 2
+          version = ""
+          if bump:
+              version = {3: f"{major + 1}.0.0", 2: f"{major}.{minor + 1}.0", 1: f"{major}.{minor}.{patch + 1}"}[bump]
+          print(f"base {'.'.join(map(str, base))}, commits {' '.join(span)}: " + (f"release {version}" if version else "no feat: or fix:, nothing to release"))
+
+          sections = [("Features", notes["feat"]), ("Fixes", notes["fix"])]
+          text = "\n\n".join(f"## {title}\n\n" + "\n".join(lines) for title, lines in sections if lines)
+          os.makedirs("notes", exist_ok=True)
+          with open("notes/notes.md", "w") as f:
+              f.write(text + "\n")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"version={version}\n")
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: steps.next.outputs.version != ''
+        with:
+          name: release-notes
+          path: notes/notes.md
+          retention-days: 7
+
+  build:
+    name: Build
+    needs: version
+    if: needs.version.outputs.version != ''
+    runs-on: ubuntu-latest
+    # No id-token, no secrets, no cache: nothing a dependency's build script
+    # could steal or poison.
+    permissions:
+      contents: read
+    env:
+      FW_VERSION: ${{ needs.version.outputs.version }}
+      CHIP: ${{ needs.version.outputs.chip }}
+      PRODUCT: ${{ needs.version.outputs.product }}
+      PARTITIONS: ${{ needs.version.outputs.partitions }}
+      FLASH_SIZE: ${{ inputs.flash-size }}
+      MAX_SLOT_PERCENT: ${{ inputs.max-slot-percent }}
+      FORBIDDEN: ${{ inputs.image-scan-forbidden }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Check inputs
+        run: |
+          [[ "$FLASH_SIZE" =~ ^[0-9]+mb$ ]] || { echo "::error::flash-size must look like 4mb"; exit 1; }
+          [[ "$FW_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::bad version $FW_VERSION"; exit 1; }
+
+      - name: Install ESP toolchain
+        uses: esp-rs/xtensa-toolchain@ec6d36527049a7f4fb2cb0c1a644668c1bb8a2a4 # v1.7.0
+        with:
+          buildtargets: ${{ needs.version.outputs.chip }}
+          ldproxy: true
+        env:
+          GITHUB_TOKEN: ${{ github.token }} # read-only: release downloads of the toolchain
+
+      - name: Set up swap space
+        uses: pierotofy/set-swap-space@fc79b3f67fa8a838184ce84a674ca12238d2c761 # master
+        with:
+          swap-size-gb: 10
+
+      - name: Install cargo-espflash and cargo-cyclonedx
+        run: |
+          espflash="$RUNNER_TEMP/cargo-espflash.zip"
+          curl --fail --location --retry 3 --output "$espflash" \
+            "https://github.com/esp-rs/espflash/releases/download/v${ESPFLASH_VERSION}/cargo-espflash-x86_64-unknown-linux-gnu.zip"
+          echo "${ESPFLASH_SHA256}  ${espflash}" | sha256sum --check
+          unzip -q "$espflash" -d "$HOME/.cargo/bin"
+          cdx="$RUNNER_TEMP/cargo-cyclonedx.tar.xz"
+          curl --fail --location --retry 3 --output "$cdx" \
+            "https://github.com/CycloneDX/cyclonedx-rust-cargo/releases/download/cargo-cyclonedx-${CYCLONEDX_VERSION}/cargo-cyclonedx-x86_64-unknown-linux-gnu.tar.xz"
+          echo "${CYCLONEDX_SHA256}  ${cdx}" | sha256sum --check
+          tar -xJf "$cdx" -C "$RUNNER_TEMP"
+          install -m 0755 "$RUNNER_TEMP/cargo-cyclonedx-x86_64-unknown-linux-gnu/cargo-cyclonedx" "$HOME/.cargo/bin/"
+          chmod +x "$HOME/.cargo/bin/cargo-espflash"
+
+      # platform-build reads only platform.toml; FW_VERSION pins the version
+      # the image reports (it refuses anything but X.Y.Z).
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: OTA image (app.bin)
+        run: |
+          mkdir -p dist
+          # save-image builds again, with the same FW_VERSION.
+          if ! out="$(cargo espflash save-image --release --chip "$CHIP" --flash-size "$FLASH_SIZE" \
+            --partition-table "$PARTITIONS" --target-app-partition ota_0 dist/app.bin 2>&1)"; then
+            echo "$out"; echo "::error::cargo espflash save-image failed"; exit 1
+          fi
+          echo "$out"
+          line="$(grep 'App/part. size' <<< "$out")"
+          used="$(sed -E 's/.*size: *([0-9,]+)\/.*/\1/; s/,//g' <<< "$line")"
+          slot="$(sed -E 's/.*\/([0-9,]+) bytes.*/\1/; s/,//g' <<< "$line")"
+          percent=$(( used * 100 / slot ))
+          echo "### ${PRODUCT} ${FW_VERSION}: ${used} of ${slot} bytes (${percent}% of an OTA slot)" >> "$GITHUB_STEP_SUMMARY"
+          if (( percent > MAX_SLOT_PERCENT )); then
+            echo "::error::The image takes ${percent}% of an OTA slot (limit ${MAX_SLOT_PERCENT}%)."; exit 1
+          fi
+
+      # Bootloader (the project's own, with rollback: espflash.toml), partition
+      # table, blank otadata and the app at ota_0: what `ergo commission`
+      # flashes onto a blank board.
+      - name: First-flash image (factory.bin)
+        run: >-
+          cargo espflash save-image --release --chip "$CHIP" --flash-size "$FLASH_SIZE"
+          --partition-table "$PARTITIONS" --target-app-partition ota_0 --merge --skip-padding dist/factory.bin
+
+      - name: Check the images
+        run: |
+          shopt -s nullglob
+          for image in dist/app.bin dist/factory.bin; do
+            grep -aqF "$FW_VERSION" "$image" || { echo "::error::$image does not carry version $FW_VERSION"; exit 1; }
+            # Allowed PEM blocks: the Amazon root CA and the product's signing
+            # public keys (compiled into the keyring).
+            python3 scripts/scan-image.py "$image" certs/AmazonRootCA1.pem keys/*.pub.pem
+            while IFS= read -r needle; do
+              [[ -z "$needle" ]] && continue
+              if grep -aqF -- "$needle" "$image"; then
+                echo "::error::$image contains a forbidden string (image-scan-forbidden)"; exit 1
+              fi
+            done <<< "$FORBIDDEN"
+          done
+
+      # Informational: a failure here never blocks a release.
+      - name: SBOM
+        continue-on-error: true
+        run: |
+          cargo cyclonedx --format json --spec-version 1.5 --override-filename sbom
+          mv sbom.json dist/sbom.cdx.json
+
+      - name: Manifest
+        shell: python3 {0}
+        run: |
+          import hashlib, json, os
+          def sha(path):
+              with open(path, "rb") as f:
+                  return hashlib.sha256(f.read()).hexdigest()
+          m = {"contract": 1, "product": os.environ["PRODUCT"], "version": os.environ["FW_VERSION"],
+               "sha256": sha("dist/app.bin"), "size": os.path.getsize("dist/app.bin"),
+               "factory_sha256": sha("dist/factory.bin")}
+          # Canonical: keys sorted, no whitespace, no trailing newline. The
+          # device refuses any other encoding.
+          with open("dist/manifest.json", "w") as f:
+              f.write(json.dumps(m, sort_keys=True, separators=(",", ":"), ensure_ascii=False))
+          print(open("dist/manifest.json").read())
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: firmware
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Sign & publish
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    # Only protected main may deploy to it; it holds FIRMWARE_SIGNING_KEY, and
+    # the product's AWS role trusts only this Environment (in this workflow).
+    environment: release
+    permissions:
+      contents: write # tag and GitHub Release
+      id-token: write # AWS OIDC
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      PRODUCT: ${{ needs.version.outputs.product }}
+      BUCKET: ${{ inputs.firmware-bucket }}
+    steps:
+      # For keys/: the signature must verify with one the devices carry.
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: firmware
+          path: dist
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-notes
+          path: notes
+
+      - name: Re-hash against the manifest
+        shell: python3 {0}
+        run: |
+          import hashlib, json, os
+          raw = open("dist/manifest.json", "rb").read()
+          m = json.loads(raw)
+          assert json.dumps(m, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode() == raw, "not canonical"
+          def sha(p):
+              return hashlib.sha256(open(p, "rb").read()).hexdigest()
+          assert m["product"] == os.environ["PRODUCT"] and m["version"] == os.environ["VERSION"], m
+          assert m["sha256"] == sha("dist/app.bin") and m["size"] == os.path.getsize("dist/app.bin"), "app.bin"
+          assert m["factory_sha256"] == sha("dist/factory.bin"), "factory.bin"
+          print("artifact matches its manifest")
+
+      # The key exists only in this step's environment and one 0600 file that
+      # the next step shreds. Never `set -x` here.
+      - name: Sign the manifest
+        env:
+          FIRMWARE_SIGNING_KEY: ${{ secrets.FIRMWARE_SIGNING_KEY }}
+        run: |
+          umask 077
+          if [[ -z "$FIRMWARE_SIGNING_KEY" ]]; then
+            echo "::error::Environment release has no FIRMWARE_SIGNING_KEY"; exit 1
+          fi
+          printf '%s\n' "$FIRMWARE_SIGNING_KEY" > "$RUNNER_TEMP/k.pem"
+          unset FIRMWARE_SIGNING_KEY
+          openssl dgst -sha256 -sign "$RUNNER_TEMP/k.pem" -out "$RUNNER_TEMP/manifest.der" dist/manifest.json
+          openssl base64 -A -in "$RUNNER_TEMP/manifest.der" > dist/manifest.sig
+
+      - name: Shred the key
+        if: always()
+        run: |
+          if [[ -f "$RUNNER_TEMP/k.pem" ]]; then shred -u "$RUNNER_TEMP/k.pem"; fi
+
+      - name: Verify with the product's public keys
+        run: |
+          shopt -s nullglob
+          for pub in keys/*.pub.pem; do
+            if openssl dgst -sha256 -verify "$pub" -signature "$RUNNER_TEMP/manifest.der" dist/manifest.json >/dev/null 2>&1; then
+              echo "signed with $(basename "$pub" .pub.pem)"
+              exit 0
+            fi
+          done
+          echo "::error::The signature verifies with none of keys/*.pub.pem: devices and the OTA controller would refuse it."
+          exit 1
+
+      - name: Tag and GitHub pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          assets=(dist/app.bin dist/factory.bin dist/manifest.json dist/manifest.sig)
+          [[ -f dist/sbom.cdx.json ]] && assets+=(dist/sbom.cdx.json)
+          if gh release view "v$VERSION" >/dev/null 2>&1; then
+            # A re-run: the build is the same artifact; the signature is new
+            # but just as valid.
+            gh release upload "v$VERSION" "${assets[@]}" --clobber
+          else
+            gh release create "v$VERSION" "${assets[@]}" --target "$GITHUB_SHA" --prerelease \
+              --title "$PRODUCT v$VERSION" --notes-file notes/notes.md
+          fi
+
+      - name: AWS credentials (OIDC, 15 minutes)
+        uses: aws-actions/configure-aws-credentials@517a711dbcd0e402f90c77e7e2f81e849156e31d # v6.2.2
+        with:
+          role-to-assume: ${{ inputs.aws-role-arn }}
+          aws-region: ${{ inputs.aws-region }}
+          role-duration-seconds: 900
+
+      # Never overwrite a published release (If-None-Match: *). On a re-run, an
+      # object already there is accepted if it is the same bytes, or, for
+      # manifest.sig, any signature that verifies over the same manifest.
+      - name: Upload to S3 (manifest.sig last)
+        run: |
+          shopt -s nullglob
+          # An existing manifest.sig is fine if it verifies over this manifest.
+          verifies() {
+            base64 -d "$1" > "$RUNNER_TEMP/existing.der" 2>/dev/null || return 1
+            for pub in keys/*.pub.pem; do
+              openssl dgst -sha256 -verify "$pub" -signature "$RUNNER_TEMP/existing.der" dist/manifest.json >/dev/null 2>&1 && return 0
+            done
+            return 1
+          }
+          prefix="releases/$PRODUCT/$VERSION"
+          for file in app.bin factory.bin manifest.json manifest.sig; do
+            key="$prefix/$file"
+            if err=$(aws s3api put-object --bucket "$BUCKET" --key "$key" --body "dist/$file" \
+                --if-none-match '*' --output text --query ETag 2>&1); then
+              echo "uploaded s3://$BUCKET/$key"
+              continue
+            fi
+            if ! grep -q PreconditionFailed <<< "$err"; then
+              echo "$err"; echo "::error::upload of $key failed"; exit 1
+            fi
+            aws s3api get-object --bucket "$BUCKET" --key "$key" "$RUNNER_TEMP/existing" >/dev/null
+            if cmp -s "$RUNNER_TEMP/existing" "dist/$file"; then
+              echo "s3://$BUCKET/$key is already this release's"
+            elif [[ "$file" == manifest.sig ]] && verifies "$RUNNER_TEMP/existing"; then
+              echo "s3://$BUCKET/$key is already a valid signature of this manifest"
+            else
+              echo "::error::s3://$BUCKET/$key exists with other content: $VERSION was published from another build. Merge a new fix for a new version."
+              exit 1
+            fi
+          done
+          echo "### Published $PRODUCT $VERSION to s3://$BUCKET/$prefix/" >> "$GITHUB_STEP_SUMMARY"
+
+  notify:
+    name: Report a failed release
+    needs: [version, build, publish]
+    if: failure() || cancelled()
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      VERSION: ${{ needs.version.outputs.version }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Open or update the issue
+        run: |
+          title="release ${VERSION:+v$VERSION }failed"
+          body="The release workflow failed: $RUN_URL (attempt $GITHUB_RUN_ATTEMPT, commit $GITHUB_SHA).
+          Re-run its failed jobs once the cause is fixed; the OTA controller emails if a GitHub release never reaches S3."
+          number=$(gh issue list --state open --search "\"$title\" in:title" --json number,title \
+            --jq "map(select(.title == \"$title\")) | .[0].number // empty")
+          if [[ -n "$number" ]]; then
+            gh issue comment "$number" --body "$body"
+          else
+            gh issue create --title "$title" --body "$body"
+          fi
