@@ -306,11 +306,21 @@ pub fn endpoint(platform: &impl Kv, compiled: &str) -> String {
 }
 
 /// Counts this boot: returns the boot count of the running version and stores
-/// it ([`crate::shadow::next_boot_count`]).
-pub fn count_boot(platform: &mut impl Kv, running_fw: &str) -> Result<u32, String> {
+/// it ([`crate::shadow::next_boot_count`]). `fresh_install` (the image is
+/// still pending verification, i.e. on its first boot after an OTA install)
+/// starts the count over even for a version that booted before.
+pub fn count_boot(
+    platform: &mut impl Kv,
+    running_fw: &str,
+    fresh_install: bool,
+) -> Result<u32, String> {
     let stored_fw = platform.get_str(platform_keys::BOOT_FW).ok().flatten();
     let stored = platform.get_u32(platform_keys::BOOT_COUNT).ok().flatten();
-    let count = crate::shadow::next_boot_count(stored_fw.as_deref(), stored, running_fw);
+    let count = if fresh_install {
+        1
+    } else {
+        crate::shadow::next_boot_count(stored_fw.as_deref(), stored, running_fw)
+    };
     if stored_fw.as_deref() != Some(running_fw) {
         platform.set_str(platform_keys::BOOT_FW, running_fw)?;
     }
@@ -452,9 +462,13 @@ mod tests {
     #[test]
     fn boots_are_counted_per_version() {
         let mut kv = MemKv::default();
-        assert_eq!(count_boot(&mut kv, "0.8.0").unwrap(), 1);
-        assert_eq!(count_boot(&mut kv, "0.8.0").unwrap(), 2);
-        assert_eq!(count_boot(&mut kv, "0.9.0").unwrap(), 1);
+        assert_eq!(count_boot(&mut kv, "0.8.0", false).unwrap(), 1);
+        assert_eq!(count_boot(&mut kv, "0.8.0", false).unwrap(), 2);
+        assert_eq!(count_boot(&mut kv, "0.9.0", false).unwrap(), 1);
+        assert_eq!(count_boot(&mut kv, "0.9.0", false).unwrap(), 2);
+        // Rolled back, then the same version installed again.
+        assert_eq!(count_boot(&mut kv, "0.9.0", true).unwrap(), 1);
+        assert_eq!(count_boot(&mut kv, "0.9.0", false).unwrap(), 2);
         assert_eq!(kv.get_str("boot_fw").unwrap().as_deref(), Some("0.9.0"));
     }
 

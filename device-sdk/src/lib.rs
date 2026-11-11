@@ -73,7 +73,9 @@ pub use mqtt::Mqtt;
 pub use session::{ConnectOptions, Event, Session};
 
 /// Amazon Root CA 1: AWS IoT's ATS endpoints chain to it.
-pub const ROOT_CA: &str = concat!(include_str!("../certs/AmazonRootCA1.pem"), "\0");
+/// Plain PEM: the MQTT wrapper makes its own C string, which may not hold a
+/// NUL.
+pub const ROOT_CA: &str = include_str!("../certs/AmazonRootCA1.pem");
 
 static STATUS: Mutex<String> = Mutex::new(String::new());
 static KEY_SERIAL: Mutex<Option<String>> = Mutex::new(None);
@@ -161,11 +163,16 @@ impl Platform {
         }
         mqtt::init_limiter(product.limits);
         let mut platform_ns = NvsKv::open(&nvs, PLATFORM_NS)?;
-        let count = device_core::nvs::count_boot(&mut platform_ns, product.fw_version)
-            .unwrap_or_else(|e| {
-                log::warn!("could not count this boot: {e}");
-                1
-            });
+        // An image still pending verification is on its first boot after an
+        // install, whatever the counter says (the same version may have been
+        // installed, rolled back and installed again).
+        let fresh_install = boot::running_unverified();
+        let count =
+            device_core::nvs::count_boot(&mut platform_ns, product.fw_version, fresh_install)
+                .unwrap_or_else(|e| {
+                    log::warn!("could not count this boot: {e}");
+                    1
+                });
         let p = Self {
             product,
             mac: read_mac(product.mac_type),

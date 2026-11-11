@@ -52,7 +52,7 @@ pub fn generate(rf_quiet: bool) -> Result<(SigningKey, String)> {
 
 /// X||Y of the public key.
 pub fn public_key(key: &SigningKey) -> [u8; 64] {
-    let point = key.verifying_key().to_encoded_point(false);
+    let point = key.verifying_key().to_sec1_point(false);
     let mut out = [0u8; 64];
     out.copy_from_slice(&point.as_bytes()[1..65]);
     out

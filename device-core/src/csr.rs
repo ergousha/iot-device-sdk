@@ -157,7 +157,7 @@ mod tests {
     }
 
     fn xy(key: &SigningKey) -> [u8; 64] {
-        let point = key.verifying_key().to_encoded_point(false);
+        let point = key.verifying_key().to_sec1_point(false);
         point.as_bytes()[1..].try_into().unwrap()
     }
 

@@ -107,7 +107,7 @@ fn the_soft_key_identity_loads_from_a_gateway_image() {
     );
     // The SDK's own logic runs on what the device stored.
     let mut platform = platform.clone();
-    assert_eq!(count_boot(&mut platform, "0.4.0").unwrap(), 4);
+    assert_eq!(count_boot(&mut platform, "0.4.0", false).unwrap(), 4);
 }
 
 fn assert_all_types(p: &nvs_image::Partition) {

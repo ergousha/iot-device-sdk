@@ -18,4 +18,4 @@ base64.workspace = true
 # Host tests of csr.rs: a software P-256 key stands in for the device key, and
 # the result is parsed back as PKCS#10.
 p256.workspace = true
-x509-cert = "0.2"
+x509-cert = "0.3"
