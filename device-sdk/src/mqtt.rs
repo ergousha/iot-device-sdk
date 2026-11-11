@@ -28,10 +28,10 @@ use esp_idf_svc::sys::{
     esp_mqtt_client_init, esp_mqtt_client_publish, esp_mqtt_client_reconnect,
     esp_mqtt_client_register_event, esp_mqtt_client_start, esp_mqtt_client_subscribe_single,
     esp_mqtt_client_unsubscribe, esp_mqtt_error_type_t_MQTT_ERROR_TYPE_CONNECTION_REFUSED,
-    esp_mqtt_event_id_t_MQTT_EVENT_ANY, esp_mqtt_event_id_t_MQTT_EVENT_CONNECTED,
-    esp_mqtt_event_id_t_MQTT_EVENT_DATA, esp_mqtt_event_id_t_MQTT_EVENT_DISCONNECTED,
-    esp_mqtt_event_id_t_MQTT_EVENT_ERROR, esp_mqtt_event_t, ESP_ERR_MBEDTLS_SSL_HANDSHAKE_FAILED,
-    ESP_OK,
+    esp_mqtt_error_type_t_MQTT_ERROR_TYPE_TCP_TRANSPORT, esp_mqtt_event_id_t_MQTT_EVENT_ANY,
+    esp_mqtt_event_id_t_MQTT_EVENT_CONNECTED, esp_mqtt_event_id_t_MQTT_EVENT_DATA,
+    esp_mqtt_event_id_t_MQTT_EVENT_DISCONNECTED, esp_mqtt_event_id_t_MQTT_EVENT_ERROR,
+    esp_mqtt_event_t, ESP_ERR_MBEDTLS_SSL_HANDSHAKE_FAILED, ESP_OK,
 };
 
 /// QoS 1 for the platform's own traffic: AWS IoT does not support QoS 2.
@@ -72,6 +72,9 @@ pub struct ConnectError {
     /// The platform refused (CONNACK refusal, TLS handshake rejected): back
     /// off for long.
     pub refused: bool,
+    /// The connection is affected (a transport error or a refused CONNECT),
+    /// rather than a single request (a refused SUBSCRIBE, say).
+    pub connection: bool,
     pub detail: String,
 }
 
@@ -310,11 +313,12 @@ pub fn wait_connected(events: &Receiver<MqttEvent>, timeout: Duration) -> Result
         let left = deadline.saturating_duration_since(std::time::Instant::now());
         match events.recv_timeout(left) {
             Ok(MqttEvent::Connected) => return Ok(()),
-            Ok(MqttEvent::Error(e)) => return Err(e),
+            Ok(MqttEvent::Error(e)) if e.connection => return Err(e),
             Ok(_) => continue,
             Err(_) => {
                 return Err(ConnectError {
                     refused: false,
+                    connection: true,
                     detail: format!("no MQTT connection within {} s", timeout.as_secs()),
                 })
             }
@@ -348,8 +352,11 @@ unsafe extern "C" fn on_event(
             let refused = codes.error_type
                 == esp_mqtt_error_type_t_MQTT_ERROR_TYPE_CONNECTION_REFUSED
                 || codes.esp_tls_last_esp_err == ESP_ERR_MBEDTLS_SSL_HANDSHAKE_FAILED;
+            let connection =
+                refused || codes.error_type == esp_mqtt_error_type_t_MQTT_ERROR_TYPE_TCP_TRANSPORT;
             send(MqttEvent::Error(ConnectError {
                 refused,
+                connection,
                 detail: format!(
                     "type {} connack {} tls 0x{:x} errno {}",
                     codes.error_type,

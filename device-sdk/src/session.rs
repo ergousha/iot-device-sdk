@@ -246,14 +246,24 @@ impl Session {
                 }
                 was_connected.then_some(Event::Disconnected)
             }
+            MqttEvent::Error(e) if !e.connection => {
+                // One request failed (a refused SUBSCRIBE): the connection
+                // is fine.
+                log::warn!("MQTT request failed: {}", e.detail);
+                None
+            }
             MqttEvent::Error(e) => {
+                // The connection failed. While connected, esp-mqtt follows
+                // with DISCONNECTED, which ends the session's connected
+                // state; the error decides how long to back off.
                 let failure = if e.refused {
                     Failure::Refused
                 } else {
                     Failure::Network
                 };
-                self.connected_at = None;
-                self.schedule_retry(failure, e.detail);
+                if self.retry_at.is_none() {
+                    self.schedule_retry(failure, e.detail);
+                }
                 None
             }
             MqttEvent::Message { topic, data } => {
@@ -457,6 +467,13 @@ impl Session {
                 .publish(&self.shadow.update, &report.to_update())
             {
                 Ok(()) => {
+                    log::info!(
+                        "platform shadow: reported {} on {} (boot {} of it, {})",
+                        report.fw,
+                        report.slot,
+                        report.boot_count_since_update,
+                        report.boot_reason
+                    );
                     self.last_report = Some((report, now));
                     self.report_due_at = None;
                 }
