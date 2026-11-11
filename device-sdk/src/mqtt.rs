@@ -84,6 +84,16 @@ pub enum MqttEvent {
     Message { topic: String, data: Vec<u8> },
 }
 
+/// One publish.
+#[derive(Debug, Clone, Copy)]
+pub struct Message<'a> {
+    pub topic: &'a str,
+    pub payload: &'a [u8],
+    /// 0 or 1: AWS IoT has no QoS 2.
+    pub qos: i32,
+    pub retain: bool,
+}
+
 /// How the client proves its identity.
 pub enum Auth<'a> {
     /// Certificate and private key PEM in RAM (the claim; a soft key).
@@ -208,19 +218,40 @@ impl Mqtt {
 
     /// Publishes at QoS 1, through the limiter.
     pub fn publish(&self, topic: &str, payload: &[u8]) -> Result<()> {
-        self.publish_with(topic, payload, QOS1, false)
+        self.publish_message(&Message {
+            topic,
+            payload,
+            qos: QOS1,
+            retain: false,
+        })
     }
 
     /// Publishes with an explicit QoS and retain flag, through the limiter.
-    pub fn publish_with(&self, topic: &str, payload: &[u8], qos: i32, retain: bool) -> Result<()> {
+    /// One struct, not four arguments: see [`Settings`] on the Xtensa
+    /// argument-register limit.
+    pub fn publish_message(&self, message: &Message<'_>) -> Result<()> {
+        let Message {
+            topic,
+            payload,
+            qos,
+            retain,
+        } = *message;
         admit(topic, payload.len())?;
         let topic_c = CString::new(topic)?;
+        // esp-mqtt reads a length of 0 as "NUL-terminated, take strlen()".
+        // An empty slice's pointer is dangling (0x1): give it an empty C
+        // string instead, which strlen() measures as 0.
+        let data: *const core::ffi::c_char = if payload.is_empty() {
+            c"".as_ptr()
+        } else {
+            payload.as_ptr().cast()
+        };
         // SAFETY: both buffers outlive the call; esp-mqtt copies them.
         let id = unsafe {
             esp_mqtt_client_publish(
                 self.handle,
                 topic_c.as_ptr(),
-                payload.as_ptr().cast(),
+                data,
                 payload.len() as i32,
                 qos,
                 i32::from(retain),

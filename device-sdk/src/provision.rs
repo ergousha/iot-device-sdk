@@ -106,7 +106,12 @@ pub(crate) fn ensure_identity(p: &Platform) -> Result<Identity> {
         };
 
         crate::set_status("enrolling...");
-        match enrol(p, &key, &endpoint, &claim_cert, &claim_key) {
+        let claim = Claim {
+            endpoint: &endpoint,
+            cert: &claim_cert,
+            key: &claim_key,
+        };
+        match enrol(p, &key, &claim) {
             Ok(id) => {
                 let mut ns = NvsKv::open(&p.nvs, layout.namespace())?;
                 nvs::save_identity(layout, &mut ns, &id).map_err(|e| anyhow!(e))?;
@@ -159,13 +164,21 @@ fn tidy_claim(p: &Platform) {
     }
 }
 
-fn enrol(
-    p: &Platform,
-    key: &DeviceKey,
-    endpoint: &str,
-    claim_cert: &str,
-    claim_key: &str,
-) -> Result<Identity, Failure> {
+/// Where and with what to enrol. A struct, not three `&str` arguments: on
+/// Xtensa a call with more than six argument words has its later arguments
+/// read wrong by this toolchain.
+struct Claim<'a> {
+    endpoint: &'a str,
+    cert: &'a str,
+    key: &'a str,
+}
+
+fn enrol(p: &Platform, key: &DeviceKey, claim: &Claim<'_>) -> Result<Identity, Failure> {
+    let Claim {
+        endpoint,
+        cert: claim_cert,
+        key: claim_key,
+    } = *claim;
     let thing = p.mac.thing_name();
     // The CSR first: if the key cannot sign, there is no point connecting.
     let info = csr::request_info(&thing, key.public_key());
