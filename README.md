@@ -135,3 +135,7 @@ cargo fmt --all && cargo clippy --all-targets -- -D warnings && cargo test
 
 `device-sdk` builds only for an ESP32 target, inside a product repository
 (point its dependency at a local checkout with `path = "../iot-device-sdk/device-sdk"`).
+
+## License
+
+MIT, see [LICENSE](LICENSE).

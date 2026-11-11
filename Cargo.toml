@@ -25,6 +25,7 @@ edition = "2021"
 rust-version = "1.82"
 repository = "https://github.com/ergousha/iot-device-sdk"
 publish = false
+license = "MIT"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
