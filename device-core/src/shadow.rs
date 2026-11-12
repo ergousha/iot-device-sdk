@@ -85,11 +85,36 @@ pub struct Report {
     pub uptime_s: u64,
     /// Signing key ids this image accepts.
     pub key_id: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "last_job_reported"
+    )]
     pub last_job: Option<LastJob>,
     /// Echoes the desired setting, so the shadow holds no standing delta
     /// (each update with a delta would publish another billed message).
     pub telemetry: TelemetryState,
+}
+
+/// `last_job` as reported. The shadow merges `reported`: a field left out keeps
+/// its old value, so a success after a failure would still show the failure's
+/// reason. `reason` is therefore always sent, as `null` (which deletes it)
+/// when there is none. NVS keeps [`LastJob`]'s own encoding.
+fn last_job_reported<S: serde::Serializer>(job: &Option<LastJob>, s: S) -> Result<S::Ok, S::Error> {
+    #[derive(Serialize)]
+    struct Reported<'a> {
+        id: &'a str,
+        status: &'a str,
+        reason: Option<&'a str>,
+    }
+    match job {
+        Some(j) => Reported {
+            id: &j.id,
+            status: &j.status,
+            reason: (!j.reason.is_empty()).then_some(j.reason.as_str()),
+        }
+        .serialize(s),
+        None => s.serialize_none(),
+    }
 }
 
 impl Report {
@@ -226,13 +251,35 @@ mod tests {
         assert_eq!(r["boot_count_since_update"], 1);
         assert_eq!(r["key_id"][0], "vaktus-a");
         assert_eq!(r["last_job"]["status"], "SUCCEEDED");
-        assert!(r["last_job"].get("reason").is_none());
+        // Sent as null, so the shadow drops an earlier failure's reason.
+        assert!(r["last_job"]["reason"].is_null());
+        assert!(r["last_job"].as_object().unwrap().contains_key("reason"));
         assert_eq!(r["telemetry"]["enabled"], false);
 
         let mut none = report();
         none.last_job = None;
         let v: Value = serde_json::from_slice(&none.to_update()).unwrap();
         assert!(v["state"]["reported"].get("last_job").is_none());
+    }
+
+    #[test]
+    fn a_failed_job_reports_its_reason() {
+        let mut failed = report();
+        failed.last_job = Some(LastJob {
+            id: "ota-vaktus-0_9_0-c".into(),
+            status: "FAILED".into(),
+            reason: "rollback".into(),
+        });
+        let v: Value = serde_json::from_slice(&failed.to_update()).unwrap();
+        assert_eq!(v["state"]["reported"]["last_job"]["reason"], "rollback");
+    }
+
+    #[test]
+    fn nvs_keeps_the_last_job_without_an_empty_reason() {
+        let job = report().last_job.unwrap();
+        let raw = serde_json::to_string(&job).unwrap();
+        assert!(!raw.contains("reason"), "{raw}");
+        assert_eq!(serde_json::from_str::<LastJob>(&raw).unwrap(), job);
     }
 
     #[test]
