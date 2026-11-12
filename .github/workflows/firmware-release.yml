@@ -381,7 +381,7 @@ jobs:
             gh release upload "v$VERSION" "${assets[@]}" --clobber
           else
             gh release create "v$VERSION" "${assets[@]}" --target "$GITHUB_SHA" --prerelease \
-              --title "$PRODUCT v$VERSION" --notes-file notes/notes.md
+              --title "v$VERSION" --notes-file notes/notes.md
           fi
 
       - name: AWS credentials (OIDC, 15 minutes)
