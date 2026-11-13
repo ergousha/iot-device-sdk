@@ -10,6 +10,7 @@
 use std::ptr;
 
 use anyhow::Context;
+use device_core::backoff::Backoff;
 use embedded_svc::http::Headers;
 use esp_idf_svc::http::client::{Configuration as HttpConfiguration, EspHttpConnection};
 use esp_idf_svc::sys::{
@@ -19,12 +20,13 @@ use esp_idf_svc::sys::{
 use iot_jobs::{Expected, ImageCheck, InstallError};
 use log::{error, info};
 
-/// Download attempts per update before it is given up. A failed read resumes
-/// where it stopped, so these cost only what was lost. The usual cause is
-/// transient: with CONFIG_MBEDTLS_DYNAMIC_BUFFER every incoming TLS record
-/// needs a fresh ~16.7 KB block, and on a busy heap one is occasionally not
-/// there.
-const MAX_DOWNLOAD_TRIES: u32 = 5;
+/// Download tries per update before it is given up, with
+/// [`Backoff::download`] between them. A failed read resumes where it
+/// stopped, so these cost only what was lost. The usual causes are transient:
+/// a link that has just come back and does not carry HTTPS yet, or, with
+/// CONFIG_MBEDTLS_DYNAMIC_BUFFER, a busy heap without the fresh ~16.7 KB
+/// block every incoming TLS record needs.
+const MAX_DOWNLOAD_TRIES: u32 = device_core::backoff::DOWNLOAD_TRIES;
 
 /// Downloads `url` into the next OTA slot, checks it, calls `before_activate`
 /// with the slot's label and, if that succeeds, makes the slot the boot slot.
@@ -71,19 +73,21 @@ pub fn perform_ota(
         check: ImageCheck::new(),
     };
     let mut tries = 1;
+    let mut backoff = Backoff::download();
     loop {
         match dl.resume() {
             Ok(()) => break,
             Err(Failed::Verify(e)) => return Err(InstallError::Verify(e)),
             Err(Failed::Network(e)) if tries < MAX_DOWNLOAD_TRIES => {
+                let delay = backoff.next_delay_s(crate::boot::random_u32());
                 log::warn!(
-                    "OTA: download interrupted at {} bytes ({e:#}); resuming, try {} of {MAX_DOWNLOAD_TRIES} \
-                     (largest free block {} B)",
+                    "OTA: download interrupted at {} bytes ({e:#}); resuming in {delay} s, try {} of \
+                     {MAX_DOWNLOAD_TRIES} (largest free block {} B)",
                     dl.written,
                     tries + 1,
                     largest_free_block()
                 );
-                std::thread::sleep(std::time::Duration::from_secs(2 * u64::from(tries)));
+                std::thread::sleep(std::time::Duration::from_secs(delay));
                 tries += 1;
             }
             Err(Failed::Network(e)) => {

@@ -166,8 +166,10 @@ rule of yours consumes it.
   version unless the job says `downgrade: true` (an owner's rollback),
   otherwise it reports SUCCEEDED with `reason=already-newer`. It hashes the
   image as it streams, checks size and hash, then the signature against the
-  compiled-in keyring (`keys/*.pub.pem` named in `platform.toml`). Downloads
-  are retried on the device.
+  compiled-in keyring (`keys/*.pub.pem` named in `platform.toml`). A failed
+  download resumes where it stopped, up to 8 tries over 2–4 minutes (a link
+  that has just come back may not carry HTTPS yet); a `download` failure
+  after that gets the job again from the controller, up to 3 times.
 - **Failure reasons** in the job status: `verify`, `sig`, `version`,
   `rollback`, `boot` (terminal) and `download` (transient: one rerun).
   Unknown operations and other products' jobs are REJECTED.
