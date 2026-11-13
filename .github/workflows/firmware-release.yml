@@ -22,7 +22,7 @@ name: Firmware release
 #             manifest.json, a CycloneDX SBOM. Slot usage and an image scan
 #             are checked. The artifact is public and secret-free.
 # 3. publish  Environment `release` (protected main; its secret is the
-#             signing key): sign the manifest, tag and pre-release on GitHub,
+#             signing key): sign the manifest, tag and release on GitHub,
 #             then upload to releases/<product>/<X.Y.Z>/ through the product's
 #             OIDC role, which trusts only this workflow in that Environment.
 #             manifest.sig goes last: its S3 event starts the OTA controller.
@@ -368,7 +368,10 @@ jobs:
           echo "::error::The signature verifies with none of keys/*.pub.pem: devices and the OTA controller would refuse it."
           exit 1
 
-      - name: Tag and GitHub pre-release
+      # A full release, never marked Latest: its GitHub status means nothing
+      # to the rollout, which the OTA controller runs from S3 (canary, soak,
+      # fleet; `ota.sh hold` for an approval step).
+      - name: Tag and GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -380,7 +383,7 @@ jobs:
             # but just as valid.
             gh release upload "v$VERSION" "${assets[@]}" --clobber
           else
-            gh release create "v$VERSION" "${assets[@]}" --target "$GITHUB_SHA" --prerelease \
+            gh release create "v$VERSION" "${assets[@]}" --target "$GITHUB_SHA" --latest=false \
               --title "v$VERSION" --notes-file notes/notes.md
           fi
 
