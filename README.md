@@ -48,8 +48,8 @@ pipeline, cost rules, the security baseline.
   as it streams in; the new image is kept only once it reaches AWS IoT, else
   the bootloader rolls it back. Failure reasons are the contract's: `verify`,
   `sig`, `version`, `rollback`, `boot`, `download`. Unknown operations and
-  other products' jobs are REJECTED. The `signed-only` feature refuses every
-  unsigned job.
+  other products' jobs are REJECTED. The `signed-only` feature, which every
+  product enables, refuses every unsigned job.
 - **The `platform` shadow**, reported on connect, on change and every 6 h:
   `{contract, product, fw, slot, boot_reason, boot_count_since_update,
   uptime_s, key_id[], last_job, telemetry}`. Its `desired.telemetry.enabled`
@@ -60,7 +60,7 @@ pipeline, cost rules, the security baseline.
 ```toml
 # Cargo.toml
 [dependencies]
-device-sdk = { git = "https://github.com/ergousha/iot-device-sdk", rev = "…", features = ["atecc608"] }
+device-sdk = { git = "https://github.com/ergousha/iot-device-sdk", rev = "…", features = ["atecc608", "signed-only"] }
 [build-dependencies]
 platform-build = { git = "https://github.com/ergousha/iot-device-sdk", rev = "…" }
 ```
@@ -159,7 +159,7 @@ From there the platform's OTA controller verifies the signature again, runs the 
 product that predates it, `scripts/signing-keys.sh <product checkout>` does
 the same once: `<id>-a` (active) and `<id>-b` (backup), both public keys in `keys/` and `platform.toml` (every image accepts both) and in SSM `/iot-platform/products/<id>/signing_keys`, the Environment `release` (main only) with `<id>-a` as its secret, and `<id>-b` to the clipboard for the password manager. No private key is written to disk. Rotating to the backup is a `gh secret set`; no Terraform.
 
-Until a unit runs an image that has the keys, the controller sends it unsigned (v1) job documents, after checking the signature itself; from then on, signed ones. The `signed-only` feature (plan Phase 6) refuses anything unsigned.
+The controller sends only signed job documents, and every product is built with the `signed-only` feature (plan Phase 6), which refuses anything unsigned.
 
 ## Commissioning a device
 

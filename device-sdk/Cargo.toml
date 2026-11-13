@@ -16,7 +16,8 @@ license.workspace = true
 #                 (see README) and link with -Wl,--wrap=atcab_release.
 #   nvs-soft-key  a P-256 key generated on the device and kept in NVS.
 #
-# signed-only: refuse every OTA job without a signed manifest (Phase 6).
+# signed-only: refuse every OTA job without a signed manifest. Every product
+# enables it (plan Phase 6); the controller sends only signed job documents.
 [features]
 atecc608 = []
 nvs-soft-key = []

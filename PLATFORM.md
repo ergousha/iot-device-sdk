@@ -117,16 +117,19 @@ SSID there: not secret, but a sign of compiled-in Wi-Fi).
 
 ## 6. Topics and Basic Ingest
 
-What the device policy allows, all pinned to the device's own thing name:
+What the device policy allows, all pinned to the device's own thing name
+(`jobs/` is `$aws/things/<thing>/jobs/`, `shadow/` is
+`$aws/things/<thing>/shadow/name/<any name>/`):
 
 | Direction | Topics |
 |---|---|
-| Publish | `dt/<thing>/*`, `$aws/things/<thing>/jobs/*`, `$aws/things/<thing>/shadow/*`, `$aws/rules/<id>_*` |
-| Subscribe, receive | `cmd/<thing>/*`, `$aws/things/<thing>/jobs/*`, `$aws/things/<thing>/shadow/*` |
+| Publish | `dt/<thing>/*`, `jobs/*/get`, `jobs/*/update`, `shadow/get`, `shadow/update`, `$aws/rules/<id>_*` |
+| Subscribe | `cmd/<thing>/*`, `jobs/notify-next`, `jobs/*/accepted`, `jobs/*/rejected`, `shadow/get/accepted`, `shadow/get/rejected`, `shadow/update/delta`, `shadow/update/rejected` |
 
-- Subscribe to the exact answers you act on (`.../update/delta`,
-  `.../get/accepted`, `.../get/rejected`), **never** `shadow/#`: every
-  message received is billed.
+- Named shadows only; the classic shadow is not allowed.
+- Subscribe to the exact answers you act on; `update/accepted`,
+  `update/documents` and `shadow/#` are refused: they echo every report
+  back, and every message received is billed.
 - **Basic Ingest** (`$aws/rules/<id>_<rule>`) goes straight to a rule of
   your `cloud/` without the messaging fee ($0.36 a million for rule and
   action). Prefer it for telemetry.
@@ -147,8 +150,8 @@ Reported by the SDK on connect, on change and every 6 hours:
 ```
 
 The boot counter is kept in NVS. The controller's soak gate reads `fw`,
-`boot_count_since_update` and `boot_reason`; `key_id` tells it when signed
-job documents are safe. `desired.telemetry.enabled` is the product's
+`boot_count_since_update` and `boot_reason`; `key_id` lists the signing
+keys the image accepts. `desired.telemetry.enabled` is the product's
 telemetry switch: publish telemetry only while it is `true`, and only when a
 rule of yours consumes it.
 
@@ -168,8 +171,9 @@ rule of yours consumes it.
 - **Failure reasons** in the job status: `verify`, `sig`, `version`,
   `rollback`, `boot` (terminal) and `download` (transient: one rerun).
   Unknown operations and other products' jobs are REJECTED.
-- `signed-only` (an SDK feature, plan Phase 6) refuses unsigned job
-  documents.
+- **Signed only.** Every product enables the SDK's `signed-only` feature
+  (plan Phase 6): a job document without `manifest`, `sig` and `key_id`
+  fails with `sig`. The controller sends only signed ones.
 - Frozen once a unit is in the field: the partition rows `platform.toml`
   lists in `[flash] frozen` (`platform-build` checks them at every build),
   the NVS keys, the thing name.
