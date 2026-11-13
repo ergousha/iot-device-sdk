@@ -10,6 +10,10 @@
 //!
 //! An ordinary network failure (no route, a dropped TCP session) retries
 //! quickly a few times first ([`Reconnect`]).
+//!
+//! An OTA image download that fails resumes after [`Backoff::download`]: a
+//! device that has just come back online may take a minute or two before its
+//! link carries an HTTPS download, and the attempts must outlast that.
 
 /// First delay after a refusal: 60 s.
 pub const REFUSED_MIN_S: u64 = 60;
@@ -22,6 +26,11 @@ pub const QUICK_RETRIES: u32 = 3;
 /// A connection that lasted this long was healthy: the next failure starts the
 /// backoff over.
 pub const HEALTHY_AFTER_S: u64 = 10 * 60;
+/// Tries of one OTA image download (each resumes where the last stopped).
+pub const DOWNLOAD_TRIES: u32 = 8;
+/// First delay before resuming a download: 5 s, doubling up to 60 s.
+pub const DOWNLOAD_RETRY_MIN_S: u64 = 5;
+pub const DOWNLOAD_RETRY_MAX_S: u64 = 60;
 
 /// Exponential backoff with "equal jitter": each delay is uniformly in
 /// `[d/2, d]`, and `d` doubles up to the maximum.
@@ -44,6 +53,11 @@ impl Backoff {
     /// The platform's refusal backoff, 60 s to 6 h.
     pub const fn refused() -> Self {
         Self::new(REFUSED_MIN_S, REFUSED_MAX_S)
+    }
+
+    /// Between the tries of an OTA download, 5 s to 60 s.
+    pub const fn download() -> Self {
+        Self::new(DOWNLOAD_RETRY_MIN_S, DOWNLOAD_RETRY_MAX_S)
     }
 
     /// The delay before the next attempt, in seconds, given a random number
@@ -126,6 +140,17 @@ mod tests {
         assert!(*delays.last().unwrap() >= REFUSED_MAX_S / 2);
         b.reset();
         assert!(b.next_delay_s(0) <= 60);
+    }
+
+    #[test]
+    fn a_download_keeps_trying_for_two_to_four_minutes() {
+        // The waits between DOWNLOAD_TRIES tries: 5, 10, 20, 40, then 60 s,
+        // each jittered down to half.
+        for r in [0u32, 1, 7, 1000, u32::MAX] {
+            let mut b = Backoff::download();
+            let total: u64 = (1..DOWNLOAD_TRIES).map(|_| b.next_delay_s(r)).sum();
+            assert!((120..=255).contains(&total), "{r}: {total}");
+        }
     }
 
     #[test]
