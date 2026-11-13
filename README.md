@@ -7,7 +7,12 @@ owner's bench tool. Products today:
 [Vaktus Salât](https://github.com/ergousha/esp32-display-vaktus-salat-rust)
 (ESP32 + ATECC608B) and the
 [OPC UA gateway](https://github.com/ergousha/esp32-opcua-gateway-rust)
-(ESP32-S3, NVS soft key).
+(ESP32-S3, NVS soft key). New products start from
+[`iot-device-template`](https://github.com/ergousha/iot-device-template).
+
+**[PLATFORM.md](PLATFORM.md)** is the contract a product relies on: adding a
+product, secrets, commissioning, topics, the `platform` shadow, OTA, the
+pipeline, cost rules, the security baseline.
 
 | Crate | What it is | Runs on |
 |---|---|---|
@@ -16,9 +21,10 @@ owner's bench tool. Products today:
 | [`device-sdk`](device-sdk) | ESP-IDF glue: MQTT (with a secure element), NVS, OTA, ATECC608B or NVS soft key, the session | device |
 | [`platform-build`](platform-build) | build-script helper: `platform.toml`, `FW_VERSION`, keyring, partition check, bootloader staging | build host |
 | [`nvs-image`](nvs-image) | reads an ESP-IDF NVS partition dump | host |
-| [`ergo`](ergo) | the owner's CLI: `register`, `commission`, `nvs-check` | host |
+| [`ergo`](ergo) | the owner's CLI: `product init`, `register`, `commission`, `nvs-check` | host |
 | [`contract/v1`](contract/v1) | the signed-manifest test vector, made with `openssl` | — |
 | [`firmware-release.yml`](.github/workflows/firmware-release.yml) | every product's release pipeline (reusable workflow) | GitHub Actions |
+| [`tflint/`](tflint) | the cost rules for a product's `cloud/` Terraform, as tflint OPA policies (`tflint/test.sh` runs them against fixtures) | product CI |
 
 ## What every product gets
 
@@ -149,7 +155,9 @@ From there the platform's OTA controller verifies the signature again, runs the 
 
 ### Signing keys
 
-`scripts/signing-keys.sh <product checkout>` creates a product's keys once: `<id>-a` (active) and `<id>-b` (backup), both public keys in `keys/` and `platform.toml` (every image accepts both) and in SSM `/iot-platform/products/<id>/signing_keys`, the Environment `release` (main only) with `<id>-a` as its secret, and `<id>-b` to the clipboard for the password manager. No private key is written to disk. Rotating to the backup is a `gh secret set`; no Terraform.
+`ergo product init` creates a new product's keys (PLATFORM.md §2). For a
+product that predates it, `scripts/signing-keys.sh <product checkout>` does
+the same once: `<id>-a` (active) and `<id>-b` (backup), both public keys in `keys/` and `platform.toml` (every image accepts both) and in SSM `/iot-platform/products/<id>/signing_keys`, the Environment `release` (main only) with `<id>-a` as its secret, and `<id>-b` to the clipboard for the password manager. No private key is written to disk. Rotating to the backup is a `gh secret set`; no Terraform.
 
 Until a unit runs an image that has the keys, the controller sends it unsigned (v1) job documents, after checking the signature itself; from then on, signed ones. The `signed-only` feature (plan Phase 6) refuses anything unsigned.
 

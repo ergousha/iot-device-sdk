@@ -52,3 +52,24 @@ jobs:
           cd contract/v1
           openssl dgst -sha256 -verify test-key.pub.pem \
             -signature <(openssl base64 -d -A < manifest.sig) manifest.json
+
+  cloud-policies:
+    name: cloud/ policies
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      # Pinned: a TFLint release once removed a config attribute and broke
+      # every build (iot-platform CI). Bump deliberately.
+      - uses: terraform-linters/setup-tflint@90f302c255ef959cbfb4bd10581afecdb7ece3e6 # v4.1.1
+        with:
+          tflint_version: v0.64.0
+
+      - name: Policies against the fixtures
+        env:
+          GITHUB_TOKEN: ${{ github.token }} # plugin downloads (rate limit)
+        run: tflint/test.sh

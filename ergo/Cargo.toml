@@ -1,6 +1,6 @@
 [package]
 name = "ergo"
-description = "The owner's bench CLI: registers devices in the provisioning registry, commissions a device over its USB serial console inside a short claim window, and inspects NVS partition dumps."
+description = "The owner's CLI: puts a new product repository on the platform, registers devices in the provisioning registry, commissions a device over its USB serial console inside a short claim window, and inspects NVS partition dumps."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -13,7 +13,12 @@ device-core = { path = "../device-core" }
 nvs-image = { path = "../nvs-image" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+serde.workspace = true
 serde_json.workspace = true
+# `product init`: the firmware-signing key pairs, made in memory.
+p256 = { workspace = true, features = ["pkcs8", "pem"] }
+getrandom = "0.4"
+zeroize = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal", "sync"] }
 # No libudev: port enumeration is not needed, the port is named on the command line.
 serialport = { version = "4", default-features = false }

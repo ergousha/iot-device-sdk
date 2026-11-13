@@ -9,6 +9,8 @@
 //! ergo register --product vaktus --mac 38:18:2B:84:56:F4 --public-key <128 hex>
 //! # What will the SDK see in this NVS dump?
 //! ergo nvs-check --dump nvs.bin --product gateway
+//! # Put a repository made from iot-device-template on the platform:
+//! ergo product init demo --description "Demo board" --infra ../iot-platform
 //! ```
 //!
 //! The bench flow is described step by step in [`commission`]. Grown from the
@@ -18,6 +20,7 @@ mod aws;
 mod cloud;
 mod commission;
 mod nvs_check;
+mod product;
 mod record;
 mod serial;
 mod term;
@@ -48,12 +51,13 @@ const MAX_WAIT_MINUTES: u32 = 120;
 #[command(
     name = "ergo",
     version,
-    about = "Bench tool for the platform's devices: register, commission, inspect NVS.",
+    about = "The owner's tool for the platform: new products, register, commission, inspect NVS.",
     long_about = "Bench tool for the platform's devices.\n\n\
         `commission` puts a device on the platform over its USB serial console: it registers \
         the device, writes the claim credential and Wi-Fi to it, opens the claim for a few \
         minutes and waits until the device has enrolled. `register` only writes the registry \
-        record. `nvs-check` reports what the SDK will find in an NVS partition dump.\n\n\
+        record. `nvs-check` reports what the SDK will find in an NVS partition dump. \
+        `product init` puts a repository made from the template on the platform.\n\n\
         AWS credentials come from the default chain (AWS_PROFILE=...). No secret is ever \
         printed or written to a file."
 )]
@@ -82,6 +86,47 @@ enum Cmd {
     ///
     /// Exits non-zero if no identity loads.
     NvsCheck(NvsCheckArgs),
+    /// Products on the platform.
+    #[command(subcommand)]
+    Product(ProductCmd),
+}
+
+#[derive(Debug, Subcommand)]
+enum ProductCmd {
+    /// Put a repository made from iot-device-template on the platform.
+    ///
+    /// Sets the product id and chip, adds products/<id>.json to iot-platform
+    /// in a pull request and applies it, writes the platform's facts into
+    /// platform.toml, cloud/ and the repository variables, applies the
+    /// repository settings and ruleset, and last creates the signing keys and
+    /// Environment `release`. Ends with a pull request on the product. Safe
+    /// to run again after a stop.
+    Init(ProductInitArgs),
+}
+
+#[derive(Debug, Args)]
+struct ProductInitArgs {
+    /// The product id: 2-16 lowercase letters and digits, starting with a letter.
+    #[arg(value_parser = parse_product)]
+    id: String,
+    /// One line about the product (resources, the portal).
+    #[arg(long)]
+    description: String,
+    /// The iot-platform checkout, clean and on main.
+    #[arg(long, value_name = "DIR")]
+    infra: PathBuf,
+    /// The product repository checkout.
+    #[arg(long, value_name = "DIR", default_value = ".")]
+    repo: PathBuf,
+    /// esp32 or esp32s3.
+    #[arg(long, default_value = "esp32s3", value_parser = product::Chip::parse)]
+    chip: product::Chip,
+    /// Hours a release soaks on the canaries before the fleet job.
+    #[arg(long, default_value_t = 6, value_parser = clap::value_parser!(u32).range(0..=168))]
+    soak_hours: u32,
+    /// AWS region.
+    #[arg(long, default_value = DEFAULT_REGION)]
+    region: String,
 }
 
 #[derive(Debug, Args)]
@@ -294,6 +339,18 @@ async fn run(cli: Cli) -> Result<()> {
             .await
             .map(|_thing| ())
         }
+        Cmd::Product(ProductCmd::Init(args)) => {
+            let opts = product::InitOpts {
+                id: args.id,
+                description: args.description,
+                chip: args.chip,
+                soak_hours: args.soak_hours,
+                repo_dir: args.repo,
+                infra_dir: args.infra,
+            };
+            let mut ops = product::RealOps::connect(&args.region).await?;
+            product::init(&mut ops, &opts, &mut term).await
+        }
         Cmd::NvsCheck(args) => {
             let layout = args.layout()?;
             if nvs_check::check_dump(&args.dump, layout, term.out)? {
@@ -454,6 +511,68 @@ mod tests {
         assert!(commission(&["--wait-minutes", "121"]).is_err());
         let args = commission(&["--wait-minutes", "30", "--minutes", "20"]).unwrap();
         assert!(args.opts(|_| None).is_err(), "would outlive the record");
+    }
+
+    #[test]
+    fn product_init_arguments() {
+        let cli = parse(&[
+            "product",
+            "init",
+            "demo",
+            "--description",
+            "Demo",
+            "--infra",
+            "../p",
+        ])
+        .unwrap();
+        let Cmd::Product(ProductCmd::Init(args)) = cli.command else {
+            panic!()
+        };
+        assert_eq!(args.chip, product::Chip::Esp32s3);
+        assert_eq!(args.repo, PathBuf::from("."));
+        assert_eq!(args.soak_hours, 6);
+        assert!(parse(&[
+            "product",
+            "init",
+            "Demo",
+            "--description",
+            "D",
+            "--infra",
+            "p"
+        ])
+        .is_err());
+        assert!(
+            parse(&["product", "init", "demo", "--infra", "p"]).is_err(),
+            "needs a description"
+        );
+        assert!(
+            parse(&["product", "init", "demo", "--description", "D"]).is_err(),
+            "needs --infra"
+        );
+        assert!(parse(&[
+            "product",
+            "init",
+            "demo",
+            "--description",
+            "D",
+            "--infra",
+            "p",
+            "--chip",
+            "esp32c3"
+        ])
+        .is_err());
+        assert!(parse(&[
+            "product",
+            "init",
+            "demo",
+            "--description",
+            "D",
+            "--infra",
+            "p",
+            "--soak-hours",
+            "169"
+        ])
+        .is_err());
     }
 
     #[test]
