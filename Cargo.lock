@@ -1409,10 +1409,14 @@ dependencies = [
  "base64 0.22.1",
  "clap",
  "device-core",
+ "getrandom 0.4.3",
  "nvs-image",
+ "p256",
+ "serde",
  "serde_json",
  "serialport",
  "tokio",
+ "zeroize",
 ]
 
 [[package]]
