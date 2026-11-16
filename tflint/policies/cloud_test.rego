@@ -152,6 +152,67 @@ test_rule_republish_passes if {
 	count(deny_rule_republish) == 0 with terraform.resources as sink_rules
 }
 
+# --- IoT rules: the thing from clientid() --------------------------------------
+
+spoofable_identity_rules(type, schema, options) := terraform.mock_resources(type, schema, options, {"main.tf": `
+resource "aws_iot_topic_rule" "payload" {
+  name        = "demo_payload"
+  enabled     = false
+  sql         = "SELECT thing, fw FROM 'dt/+/readings'"
+  sql_version = "2016-03-23"
+}
+
+resource "aws_iot_topic_rule" "nested_payload" {
+  name        = "demo_nested_payload"
+  enabled     = false
+  sql         = "SELECT t, state.thing FROM 'dt/+/readings'"
+  sql_version = "2016-03-23"
+}
+
+resource "aws_iot_topic_rule" "topic" {
+  name        = "demo_topic"
+  enabled     = false
+  sql         = "SELECT t, v, topic(2) AS thing, timestamp() AS ts FROM 'dt/+/opcua'"
+  sql_version = "2016-03-23"
+}
+
+resource "aws_iot_topic_rule" "basic_ingest_topic" {
+  name        = "demo_basic_ingest_topic"
+  enabled     = false
+  sql         = "select topic(1) as Thing, t"
+  sql_version = "2016-03-23"
+}`})
+
+test_rule_identity_fails if {
+	count(deny_rule_identity) == 4 with terraform.resources as spoofable_identity_rules
+}
+
+clientid_identity_rules(type, schema, options) := terraform.mock_resources(type, schema, options, {"main.tf": `
+resource "aws_iot_topic_rule" "readings" {
+  name        = "demo_readings"
+  enabled     = false
+  sql         = "SELECT clientid() AS thing, fw, timestamp() AS ts FROM 'dt/+/readings'"
+  sql_version = "2016-03-23"
+}
+
+resource "aws_iot_topic_rule" "basic_ingest" {
+  name        = "demo_basic_ingest"
+  enabled     = false
+  sql         = "select t, ClientId()  AS  thing WHERE t > 0"
+  sql_version = "2016-03-23"
+}
+
+resource "aws_iot_topic_rule" "no_thing" {
+  name        = "demo_no_thing"
+  enabled     = false
+  sql         = "SELECT t, thing_type, topic(3) AS kind FROM 'dt/+/thing'"
+  sql_version = "2016-03-23"
+}`})
+
+test_rule_identity_passes if {
+	count(deny_rule_identity) == 0 with terraform.resources as clientid_identity_rules
+}
+
 # --- public endpoints ----------------------------------------------------------
 
 open_endpoints(type, schema, options) := terraform.mock_resources(type, schema, options, {"main.tf": `

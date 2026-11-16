@@ -13,6 +13,8 @@
 #                    reaches them as $aws/rules/P_*
 #   rule killable    IoT rules are tagged killable = "true"
 #   rule sql         never SELECT *: explicit, small fields
+#   rule identity    a rule's `thing` is clientid() AS thing: never a payload
+#                    field or topic(), which the device controls
 #   table billing    DynamoDB tables are PAY_PER_REQUEST (no fixed cost) and
 #                    capped by on_demand_throughput at 1-5 reads and 1-5
 #                    writes a second
@@ -135,6 +137,31 @@ deny_rule_sql contains issue if {
 	some r in topic_rules
 	r.config.sql.unknown
 	issue := tflint.issue("an IoT rule's SQL must be a literal the linter can check", r.config.sql.range)
+}
+
+# The device a message came from is `clientid() AS thing`: the platform's
+# device policy pins the client id to the thing name at iot:Connect. A
+# payload field is whatever the device wrote, and topic() is no proof either:
+# a policy `*` spans `/`, so a Basic Ingest topic may carry another thing's
+# name in any segment but the last ($aws/rules/<rule>/<other>/<thing>).
+deny_rule_identity contains issue if {
+	some r in topic_rules
+	some source in thing_sources(r.config.sql.value)
+	regex.replace(source, `\s+`, "") != "clientid()"
+	issue := tflint.issue("an IoT rule takes the thing from clientid() (SELECT clientid() AS thing): a payload field or topic() is whatever the device sent", r.config.sql.range)
+}
+
+# The SELECT list, lower-cased: up to FROM or WHERE (Basic Ingest-only rules
+# may omit FROM).
+rule_select(sql) := m[1] if {
+	some m in regex.find_all_string_submatch_n(`(?s)^\s*select\s+(.*?)(?:\s+(?:from|where)\s.*)?$`, lower(sql), 1)
+}
+
+# The expression of every output column named `thing`: "" for a payload
+# field `thing`, "topic(2)" for `topic(2) AS thing`, "state." for
+# `state.thing`.
+thing_sources(sql) := {m[1] |
+	some m in regex.find_all_string_submatch_n(`(?:^|,)\s*([^,]*?)\s*(?:\bas\s+)?\bthing\s*(?:,|$)`, rule_select(sql), -1)
 }
 
 # A republish action (or error action) feeds a rule's output back into MQTT,
