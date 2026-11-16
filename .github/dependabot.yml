@@ -1,0 +1,26 @@
+version: 2
+updates:
+  # The cooldown keeps a release out until it is two weeks old (as in
+  # iot-platform): most malicious releases are yanked within days.
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 14
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: "fix"
+      prefix-scope: "deps"
+      include: "scope"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 14
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "ci"
+      include: "scope"
