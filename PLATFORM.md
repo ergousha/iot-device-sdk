@@ -123,16 +123,22 @@ What the device policy allows, all pinned to the device's own thing name
 
 | Direction | Topics |
 |---|---|
-| Publish | `dt/<thing>/*`, `jobs/*/get`, `jobs/*/update`, `shadow/get`, `shadow/update`, `$aws/rules/<id>_*` |
+| Publish | `dt/<thing>/*`, `jobs/*/get`, `jobs/*/update`, `shadow/get`, `shadow/update`, `$aws/rules/<id>_*/<thing>` |
 | Subscribe | `cmd/<thing>/*`, `jobs/notify-next`, `jobs/*/accepted`, `jobs/*/rejected`, `shadow/get/accepted`, `shadow/get/rejected`, `shadow/update/delta`, `shadow/update/rejected` |
 
 - Named shadows only; the classic shadow is not allowed.
 - Subscribe to the exact answers you act on; `update/accepted`,
   `update/documents` and `shadow/#` are refused: they echo every report
   back, and every message received is billed.
-- **Basic Ingest** (`$aws/rules/<id>_<rule>`) goes straight to a rule of
-  your `cloud/` without the messaging fee ($0.36 a million for rule and
-  action). Prefer it for telemetry.
+- **Basic Ingest** (`$aws/rules/<id>_<rule>/<thing>`) goes straight to a
+  rule of your `cloud/` without the messaging fee ($0.36 a million for rule
+  and action). Prefer it for telemetry. The topic ends in the device's own
+  thing name; the rule's `FROM` is not evaluated, and `topic()` sees only
+  what follows `$aws/rules/<id>_<rule>/`.
+- A rule takes the device's identity from `clientid() AS thing`: the policy
+  pins the client id to the thing name. Never from a payload field or
+  `topic()`: a policy `*` also matches `/`, so the policy cannot refuse
+  `$aws/rules/<id>_<rule>/<other thing>/<thing>`.
 - The product's **named shadow** (`shadow_name`, default the product id)
   carries its configuration; the portal owner may set its desired state.
   `platform` is the SDK's shadow; never write it from product code.
@@ -233,6 +239,8 @@ these with tflint and the SDK's policies (`tflint/policies`):
   state key;
 - IoT rules are named `<id>_*` (the kill switch finds them by name), tagged
   `killable = "true"`, and select explicit small fields, never `SELECT *`;
+  their `thing` is `clientid() AS thing`, never a payload field or
+  `topic()` (§6);
 - DynamoDB tables are on-demand with an `on_demand_throughput` cap of 1–5
   reads and 1–5 writes a second (no reservation, no fixed cost);
 - Lambdas have no reserved concurrency (the account limit of 10 caps them);

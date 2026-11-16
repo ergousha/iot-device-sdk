@@ -37,7 +37,7 @@ resource "aws_iam_role" "rule" {
 resource "aws_iot_topic_rule" "readings" {
   name        = "demo_readings"
   enabled     = false
-  sql         = "SELECT t, v, topic(2) AS thing FROM 'dt/+/readings'"
+  sql         = "SELECT t, v, clientid() AS thing FROM 'dt/+/readings'"
   sql_version = "2016-03-23"
   tags        = { killable = "true" }
 
