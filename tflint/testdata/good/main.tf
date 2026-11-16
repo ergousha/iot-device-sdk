@@ -70,3 +70,27 @@ resource "aws_lambda_function" "consumer" {
   handler       = "bootstrap"
   filename      = "consumer.zip"
 }
+
+resource "aws_lambda_function_url" "consumer" {
+  function_name      = aws_lambda_function.consumer.function_name
+  authorization_type = "AWS_IAM"
+}
+
+resource "aws_apigatewayv2_route" "readings" {
+  api_id             = "abc123"
+  route_key          = "GET /readings"
+  authorization_type = "JWT"
+  authorizer_id      = "ghi789"
+}
+
+resource "aws_s3_bucket" "exports" {
+  bucket = "demo-exports"
+}
+
+resource "aws_s3_bucket_public_access_block" "exports" {
+  bucket                  = aws_s3_bucket.exports.id
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}

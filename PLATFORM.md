@@ -234,11 +234,18 @@ these with tflint and the SDK's policies (`tflint/policies`):
 - IoT rules are named `<id>_*` (the kill switch finds them by name), tagged
   `killable = "true"`, and select explicit small fields, never `SELECT *`;
 - DynamoDB tables are on-demand with an `on_demand_throughput` cap of 1–5
-  writes a second (no reservation, no fixed cost);
+  reads and 1–5 writes a second (no reservation, no fixed cost);
 - Lambdas have no reserved concurrency (the account limit of 10 caps them);
 - log groups keep 1–3 days; Logs sinks only behind a debug variable, off by
   default;
-- names are `<id>-*` (log groups `/<id>/*`).
+- names are `<id>-*` (log groups `/<id>/*`);
+- no `aws_iot_role_alias` or `aws_iot_authorizer` (device identity and
+  access are the platform's), and IoT rules never republish (action or
+  error action), which could loop through MQTT;
+- no unauthenticated ingress: a Lambda function URL is `AWS_IAM`, an API
+  Gateway method or route has an authorization (not `NONE`);
+- every `aws_s3_bucket.X` has `aws_s3_bucket_public_access_block.X` with
+  all four blocks `true`.
 
 An exception takes `# tflint-ignore: opa_deny_<rule>` with its reason.
 
