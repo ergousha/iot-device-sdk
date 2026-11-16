@@ -22,6 +22,35 @@ pub trait Console {
     async fn read_line(&mut self, timeout: Duration) -> Result<Option<String>>;
 }
 
+/// Bytes per write before a pause. A board whose console has no UART driver
+/// (Vaktus: classic ESP32, CH340 on UART0) reads straight from the 128-byte
+/// hardware RX FIFO, polled every 50 ms; a 1-2 KB `SET` line sent at once
+/// overflows it and the device loses the tail, newline included, and never
+/// answers. Small chunks with pauses keep the FIFO under half full; a claim
+/// key line then takes about 3 s.
+const PACE_CHUNK: usize = 64;
+const PACE_PAUSE: Duration = Duration::from_millis(80);
+
+/// Writes `line` and `\n` in `chunk`-byte pieces, each flushed (drained to
+/// the wire) and followed by `pause`.
+fn write_paced(
+    w: &mut dyn Write,
+    line: &str,
+    chunk: usize,
+    pause: Duration,
+) -> std::io::Result<()> {
+    let mut bytes = line.as_bytes().to_vec();
+    bytes.push(b'\n');
+    for piece in bytes.chunks(chunk) {
+        w.write_all(piece)?;
+        w.flush()?;
+        if !pause.is_zero() {
+            std::thread::sleep(pause);
+        }
+    }
+    Ok(())
+}
+
 pub struct SerialConsole {
     writer: Box<dyn serialport::SerialPort>,
     lines: mpsc::UnboundedReceiver<Result<String, String>>,
@@ -93,10 +122,7 @@ fn read_lines(port: &mut dyn Read, tx: &mpsc::UnboundedSender<Result<String, Str
 
 impl Console for SerialConsole {
     fn send_line(&mut self, line: &str) -> Result<()> {
-        self.writer
-            .write_all(line.as_bytes())
-            .and_then(|()| self.writer.write_all(b"\n"))
-            .and_then(|()| self.writer.flush())
+        write_paced(self.writer.as_mut(), line, PACE_CHUNK, PACE_PAUSE)
             .context("serial port write failed")
     }
 
@@ -113,6 +139,14 @@ impl Console for SerialConsole {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn paced_write_sends_the_whole_line() {
+        let line = "PLATFORM SET claim_cert ".to_string() + &"A".repeat(1000);
+        let mut out: Vec<u8> = Vec::new();
+        write_paced(&mut out, &line, 64, Duration::ZERO).unwrap();
+        assert_eq!(out, format!("{line}\n").into_bytes());
+    }
 
     #[test]
     fn bytes_become_lines() {
