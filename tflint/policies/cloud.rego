@@ -14,12 +14,23 @@
 #   rule killable    IoT rules are tagged killable = "true"
 #   rule sql         never SELECT *: explicit, small fields
 #   table billing    DynamoDB tables are PAY_PER_REQUEST (no fixed cost) and
-#                    capped by on_demand_throughput at 1-5 writes a second
+#                    capped by on_demand_throughput at 1-5 reads and 1-5
+#                    writes a second
 #   lambda           no reserved_concurrent_executions: the account limit
 #                    of 10 caps every Lambda
 #   log retention    log groups keep 1-3 days
 #   names            IAM roles, Lambdas, tables: P-*; log groups /P/* or
 #                    /aws/lambda/P-*
+#   iot auth         no aws_iot_role_alias (certificate-to-AWS-credentials
+#                    exchange) or aws_iot_authorizer: device identity and
+#                    access are the platform's
+#   public endpoint  no unauthenticated ingress: a Lambda function URL is
+#                    AWS_IAM; an API Gateway method or route has an
+#                    authorizer (not NONE)
+#   rule republish   IoT rules never republish (action or error action): a
+#                    rule feeding MQTT can loop through itself or others
+#   s3 public        every aws_s3_bucket.X has aws_s3_bucket_public_access_block.X
+#                    with all four blocks set to true
 #
 # A deliberate exception takes a `# tflint-ignore: opa_deny_<rule>` comment
 # with its reason on the line above.
@@ -126,12 +137,47 @@ deny_rule_sql contains issue if {
 	issue := tflint.issue("an IoT rule's SQL must be a literal the linter can check", r.config.sql.range)
 }
 
+# A republish action (or error action) feeds a rule's output back into MQTT,
+# where it can match this rule or another one: a loop the guard sees only
+# after it has billed. A product writes to a sink (Logs, DynamoDB, Lambda).
+republish_rules := terraform.resources("aws_iot_topic_rule", {
+	"republish": {"topic": "string"},
+	"error_action": {"republish": {"topic": "string"}},
+}, {})
+
+deny_rule_republish contains issue if {
+	some r in republish_rules
+	some block in r.config.republish
+	issue := tflint.issue("IoT rules never republish: output back into MQTT can loop through this or another rule", block.decl_range)
+}
+
+deny_rule_republish contains issue if {
+	some r in republish_rules
+	some action in r.config.error_action
+	some block in action.config.republish
+	issue := tflint.issue("IoT rules never republish, not even as the error action: output back into MQTT can loop through this or another rule", block.decl_range)
+}
+
+# --- IoT identity --------------------------------------------------------------
+
+# A role alias exchanges a device certificate for AWS credentials
+# (iot:AssumeRoleWithCertificate); a custom authorizer lets clients connect
+# without one. Device identity and access are the platform's.
+deny_iot_auth contains issue if {
+	some type in ["aws_iot_role_alias", "aws_iot_authorizer"]
+	some r in terraform.resources(type, {}, {})
+	issue := tflint.issue(sprintf("no %s in a product's cloud/: device identity and access are the platform's", [type]), r.decl_range)
+}
+
 # --- DynamoDB ------------------------------------------------------------------
 
 tables := terraform.resources("aws_dynamodb_table", {
 	"name": "string",
 	"billing_mode": "string",
-	"on_demand_throughput": {"max_write_request_units": "number"},
+	"on_demand_throughput": {
+		"max_read_request_units": "number",
+		"max_write_request_units": "number",
+	},
 }, {})
 
 deny_table_billing contains issue if {
@@ -143,14 +189,18 @@ deny_table_billing contains issue if {
 deny_table_billing contains issue if {
 	some t in tables
 	not table_capped(t)
-	issue := tflint.issue("DynamoDB tables need on_demand_throughput { max_write_request_units = 1..5 }", t.decl_range)
+	issue := tflint.issue("DynamoDB tables need on_demand_throughput { max_read_request_units = 1..5, max_write_request_units = 1..5 } (uncapped on-demand throughput has no ceiling on cost)", t.decl_range)
 }
 
 table_capped(t) if {
 	some block in t.config.on_demand_throughput
-	w := block.config.max_write_request_units.value
-	w >= 1
-	w <= 5
+	units_capped(block.config.max_read_request_units)
+	units_capped(block.config.max_write_request_units)
+}
+
+units_capped(u) if {
+	u.value >= 1
+	u.value <= 5
 }
 
 # --- Lambda --------------------------------------------------------------------
@@ -159,6 +209,55 @@ deny_lambda_concurrency contains issue if {
 	some f in terraform.resources("aws_lambda_function", {"reserved_concurrent_executions": "number"}, {})
 	r := f.config.reserved_concurrent_executions
 	issue := tflint.issue("no reserved_concurrent_executions: it would take from the account's 10, which cap every Lambda", r.range)
+}
+
+# --- public endpoints ----------------------------------------------------------
+
+# Anyone on the internet can call an unauthenticated endpoint, and every call
+# is billed to the account: a denial-of-wallet door.
+deny_public_endpoint contains issue if {
+	some u in terraform.resources("aws_lambda_function_url", {"authorization_type": "string"}, {})
+	not u.config.authorization_type.value == "AWS_IAM"
+	issue := tflint.issue("a Lambda function URL is authorization_type = \"AWS_IAM\": NONE lets anyone call it, at the account's cost", u.decl_range)
+}
+
+deny_public_endpoint contains issue if {
+	some m in terraform.resources("aws_api_gateway_method", {"authorization": "string"}, {})
+	not method_authorized(m)
+	issue := tflint.issue("an API Gateway method needs an authorization (AWS_IAM, CUSTOM or COGNITO_USER_POOLS), not NONE", m.decl_range)
+}
+
+deny_public_endpoint contains issue if {
+	some r in terraform.resources("aws_apigatewayv2_route", {"authorization_type": "string"}, {})
+	not route_authorized(r)
+	issue := tflint.issue("an API Gateway route needs an authorization_type (AWS_IAM, CUSTOM or JWT); it defaults to NONE", r.decl_range)
+}
+
+# Helpers, so that a missing attribute (undefined) counts as unauthorized.
+method_authorized(m) if m.config.authorization.value in {"AWS_IAM", "CUSTOM", "COGNITO_USER_POOLS"}
+
+route_authorized(r) if r.config.authorization_type.value in {"AWS_IAM", "CUSTOM", "JWT"}
+
+# --- S3 ------------------------------------------------------------------------
+
+# Every bucket aws_s3_bucket.X has aws_s3_bucket_public_access_block.X (same
+# resource name: the bucket reference itself is unknown to the linter) that
+# blocks all four ways to make it public.
+public_access_flags := ["block_public_acls", "block_public_policy", "ignore_public_acls", "restrict_public_buckets"]
+
+public_access_blocks := terraform.resources("aws_s3_bucket_public_access_block", {f: "bool" | some f in public_access_flags}, {})
+
+public_access_blocked contains b.name if {
+	some b in public_access_blocks
+	every f in public_access_flags {
+		b.config[f].value == true
+	}
+}
+
+deny_s3_public contains issue if {
+	some b in terraform.resources("aws_s3_bucket", {}, {})
+	not b.name in public_access_blocked
+	issue := tflint.issue(sprintf("aws_s3_bucket.%s needs aws_s3_bucket_public_access_block.%s with %s all true", [b.name, b.name, concat(", ", public_access_flags)]), b.decl_range)
 }
 
 # --- Logs ----------------------------------------------------------------------

@@ -40,6 +40,18 @@ resource "aws_iot_topic_rule" "readings" {
     log_group_name = aws_cloudwatch_log_group.readings.name
     role_arn       = aws_iam_role.rule.arn
   }
+
+  republish {
+    topic    = "dt/demo/readings"
+    role_arn = aws_iam_role.rule.arn
+  }
+
+  error_action {
+    republish {
+      topic    = "dt/demo/errors"
+      role_arn = aws_iam_role.rule.arn
+    }
+  }
 }
 
 resource "aws_dynamodb_table" "readings" {
@@ -62,4 +74,63 @@ resource "aws_lambda_function" "consumer" {
   handler                        = "bootstrap"
   filename                       = "consumer.zip"
   reserved_concurrent_executions = 1
+}
+
+resource "aws_dynamodb_table" "events" {
+  name         = "demo-events"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "thing"
+
+  attribute {
+    name = "thing"
+    type = "S"
+  }
+
+  on_demand_throughput {
+    max_write_request_units = 2
+  }
+}
+
+resource "aws_iot_role_alias" "device" {
+  alias    = "demo-device"
+  role_arn = aws_iam_role.rule.arn
+}
+
+resource "aws_iot_authorizer" "open" {
+  name                    = "demo-open"
+  authorizer_function_arn = aws_lambda_function.consumer.arn
+  signing_disabled        = true
+}
+
+resource "aws_lambda_function_url" "consumer" {
+  function_name      = aws_lambda_function.consumer.function_name
+  authorization_type = "NONE"
+}
+
+resource "aws_api_gateway_method" "readings" {
+  rest_api_id   = "abc123"
+  resource_id   = "def456"
+  http_method   = "GET"
+  authorization = "NONE"
+}
+
+resource "aws_apigatewayv2_route" "readings" {
+  api_id    = "abc123"
+  route_key = "GET /readings"
+}
+
+resource "aws_s3_bucket" "exports" {
+  bucket = "demo-exports"
+}
+
+resource "aws_s3_bucket" "assets" {
+  bucket = "demo-assets"
+}
+
+resource "aws_s3_bucket_public_access_block" "assets" {
+  bucket                  = aws_s3_bucket.assets.id
+  block_public_acls       = true
+  block_public_policy     = false
+  ignore_public_acls      = true
+  restrict_public_buckets = true
 }
