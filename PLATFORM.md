@@ -147,7 +147,10 @@ What the device policy allows, all pinned to the device's own thing name
   `$aws/rules/<id>_<rule>/<other thing>/<thing>`.
 - The product's **named shadow** (`shadow_name`, default the product id)
   carries its configuration; the portal owner may set its desired state.
-  `platform` is the SDK's shadow; never write it from product code.
+  `platform` is the SDK's shadow; never write it from product code. A
+  device may use these two shadows only (the product's shadow policy, on
+  its fleet and excluded groups): any other named shadow, or the classic
+  one, is refused, and the broker drops the connection.
 - Every publish passes the SDK's limiter (§10).
 
 ## 7. The `platform` shadow
