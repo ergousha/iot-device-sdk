@@ -200,9 +200,9 @@ rule of yours consumes it.
 Every merge to `main` runs the SDK's `firmware-release.yml`: version from
 the conventional commits since the last `v*` tag (`feat` → minor, `fix` →
 patch; nothing else releases), a build with no secrets, the signed manifest,
-a GitHub release (not marked Latest: its GitHub status does not affect the
-rollout), the upload to `releases/<id>/<X.Y.Z>/`. A failure opens
-an issue "release vX.Y.Z failed".
+a GitHub release, the upload to `releases/<id>/<X.Y.Z>/`, then the release
+is marked Latest (its GitHub status does not affect the rollout). A failure
+opens an issue "release vX.Y.Z failed".
 
 The platform's OTA controller then, every 15 minutes and on each upload:
 verifies the signature again; runs a canary job on `<id>-canary` (or picks
