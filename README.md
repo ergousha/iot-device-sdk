@@ -120,7 +120,7 @@ The `atecc608` feature needs the product to declare CryptoAuthLib with
 
 ## Releasing
 
-Every merge to a product's `main` runs [`firmware-release.yml`](.github/workflows/firmware-release.yml). The product's `release.yml` only calls it, pinned by commit SHA:
+Every merge to a product's `main` runs [`firmware-release.yml`](.github/workflows/firmware-release.yml). The product's `release.yml` only calls it, pinned by commit SHA. The SHA must be a merged commit that iot-platform lists in `release_workflow_shas` (the `job_workflow_ref` its AWS roles accept); any other commit cannot publish:
 
 ```yaml
 on:
@@ -137,9 +137,11 @@ jobs:
       contents: write   # tag and GitHub release
       id-token: write   # AWS OIDC, in the publish job only
       issues: write     # "release vX.Y.Z failed"
-    # Environment secrets reach a called workflow only through inherit; keep
-    # no repository-level secrets in a product repository.
-    secrets: inherit # zizmor: ignore[secrets-inherit]
+    # Passed by name, never `secrets: inherit`. It lives in Environment
+    # `release`, which only the workflow's publish job sets; keep no
+    # repository-level secrets in a product repository.
+    secrets:
+      FIRMWARE_SIGNING_KEY: ${{ secrets.FIRMWARE_SIGNING_KEY }}
     with:
       flash-size: 4mb
       aws-role-arn: ${{ vars.AWS_ROLE_ARN }}
@@ -148,7 +150,7 @@ jobs:
 
 1. **version**: the next semver from the conventional commits since the newest `v*` tag (`feat` → minor, `fix` → patch, breaking → major, or minor below 1.0). Without a `feat:` or `fix:` nothing is released.
 2. **build**, with no secrets, no AWS and no cache: `app.bin` (the OTA image), `factory.bin` (bootloader, partition table and app, for a first flash), the canonical `manifest.json` and a CycloneDX SBOM. The app must fit 90 % of an OTA slot. Both images are scanned: PEM blocks other than the Amazon root CA and `keys/*.pub.pem` fail the build, and so does any string listed in the `image-scan-forbidden` input.
-3. **publish**, in Environment `release`: re-hash against the manifest, sign it with `FIRMWARE_SIGNING_KEY` (the key touches one 0600 file, shredded afterwards), check that the signature verifies with one of `keys/*.pub.pem`, tag `vX.Y.Z` and create a GitHub release with the assets (not marked Latest; the controller decides the rollout, not the GitHub status), then upload to `s3://<bucket>/releases/<product>/<X.Y.Z>/` with `If-None-Match: *`, `manifest.sig` last. The product's AWS role trusts only this workflow, in that Environment, for 15 minutes.
+3. **publish**, in Environment `release`: re-hash against the manifest, sign it with `FIRMWARE_SIGNING_KEY` (the key touches one 0600 file, shredded afterwards), check that the signature verifies with one of `keys/*.pub.pem`, tag `vX.Y.Z` and create a GitHub release with the assets (not marked Latest; the controller decides the rollout, not the GitHub status), then upload to `s3://<bucket>/releases/<product>/<X.Y.Z>/` with `If-None-Match: *`, `manifest.sig` last. The product's AWS role trusts only this workflow, at the commits iot-platform lists in `release_workflow_shas`, in that Environment, for 15 minutes.
 4. **notify**: on failure, an issue "release vX.Y.Z failed" (email and mobile push).
 
 From there the platform's OTA controller verifies the signature again, runs the release on the canaries, soaks it and promotes it (iot-platform README §3).

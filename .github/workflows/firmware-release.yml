@@ -10,6 +10,8 @@ name: Firmware release
 #     release:
 #       uses: ergousha/iot-device-sdk/.github/workflows/firmware-release.yml@<sha> # vX.Y.Z
 #       permissions: { contents: write, id-token: write, issues: write }
+#       secrets:
+#         FIRMWARE_SIGNING_KEY: ${{ secrets.FIRMWARE_SIGNING_KEY }}
 #       with:
 #         flash-size: 4mb
 #         aws-role-arn: ${{ vars.AWS_ROLE_ARN }}
@@ -30,6 +32,11 @@ name: Firmware release
 #
 # The OTA controller (iot-platform) verifies the signature again, and so does
 # the device.
+#
+# The product's AWS role accepts only the commits of this file listed in
+# iot-platform's release_workflow_shas, so a product pinning any other commit
+# (an unmerged pull request's, say) cannot publish. Changing this file means
+# adding the new merged commit there before products pin it.
 
 on:
   workflow_call:
@@ -57,6 +64,15 @@ on:
         description: Newline-separated strings an image must not contain (the owner's SSID, say). Not secrets.
         type: string
         default: ""
+    secrets:
+      # An Environment `release` secret. The caller passes it by name
+      # (`FIRMWARE_SIGNING_KEY: ${{ secrets.FIRMWARE_SIGNING_KEY }}`, never
+      # `secrets: inherit`); only the publish job, which sets the
+      # Environment, receives its value. `required` only checks that the
+      # caller passes it: an empty value fails in "Sign the manifest".
+      FIRMWARE_SIGNING_KEY:
+        description: The product's firmware signing key (PKCS#8 PEM), from Environment `release`.
+        required: true
 
 permissions: {}
 

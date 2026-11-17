@@ -25,6 +25,12 @@ Bumping the SDK is a deliberate human click (Dependabot opens it). A bump
 that changes device behaviour is a `fix:` or `feat:` commit in the product
 (it releases); one that does not, `chore:` or `ci:` (it does not).
 
+The `firmware-release.yml@<sha>` pin is stricter: the product's AWS role
+accepts only the SDK commits listed in iot-platform's
+`release_workflow_shas`. Bump it only to a merged commit listed there (add
+it there first, in a pull request to iot-platform, when the workflow
+changes); a release from any other commit fails at the AWS step.
+
 ## 2. Adding a product
 
 1. On GitHub, **Use this template** on
@@ -265,19 +271,28 @@ every 60 s while visible.
 
 - Public repositories, sole write access. The default-branch ruleset: pull
   request with 0 approvals (a sole owner cannot approve their own), required
-  check `Firmware CI`, linear history, no force-push or deletion.
+  check `Firmware CI`, linear history, no force-push or deletion. The
+  template repository carries the same ruleset.
+- The SDK repository: the default-branch ruleset with the check
+  `fmt, clippy, test` and without linear history (products pin its commits,
+  so pull requests are merged with a merge commit, never squashed), and a
+  tag ruleset: no `v*` tag may be moved or deleted.
 - Workflow token read-only by default, and it cannot approve pull requests;
-  fork pull requests from outside contributors need approval; secret
-  scanning with push protection; Dependabot security updates with the `fix`
-  prefix.
+  fork pull requests need approval from **all** outside contributors
+  (`all_external_contributors`, not only first-time ones), in the SDK and
+  template repositories too; secret scanning with push protection;
+  Dependabot security updates with the `fix` prefix.
 - Workflows: `pull_request` only (never `pull_request_target`,
   `workflow_run`, `issue_comment`), actions pinned by SHA, no caches in a job
   that holds a secret, zizmor on every workflow change, no self-hosted
-  runners.
+  runners. Secrets are passed to a called workflow by name, never with
+  `secrets: inherit`.
 - Environment `release`: `main` only, holds the signing key, no reviewer:
   the signature is the gate, checked by the controller and by the device.
   The product's AWS role trusts only that Environment inside the SDK's
-  release workflow, may write only `releases/<id>/*`, for 15 minutes.
+  release workflow at a commit iot-platform lists (`release_workflow_shas`;
+  `@*` would accept an unmerged pull request's commit), may write only
+  `releases/<id>/*`, for 15 minutes.
 - Secure Boot V2 and flash encryption are not used (irreversible eFuses);
   key binding, signing, quarantine and the limiter cover the threat.
 
