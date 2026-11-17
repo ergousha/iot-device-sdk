@@ -27,11 +27,21 @@
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
-use p256::ecdsa::signature::Verifier;
-use p256::ecdsa::{Signature, VerifyingKey};
-use p256::pkcs8::DecodePublicKey;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+
+// Signature verification. On the device, mbedTLS, which ESP-IDF links for
+// TLS anyway; the pure-Rust `p256` crate would add ~59 KB to the image. On
+// the host, `p256`, so the tests and test vectors keep running there. Both
+// accept exactly the keys `spki_from_pem` lets through.
+#[cfg(target_os = "espidf")]
+mod mbedtls;
+#[cfg(target_os = "espidf")]
+use mbedtls::PublicKey;
+#[cfg(not(target_os = "espidf"))]
+mod rustcrypto;
+#[cfg(not(target_os = "espidf"))]
+use rustcrypto::PublicKey;
 
 /// The manifest contract this crate implements.
 pub const CONTRACT: u64 = 1;
@@ -175,7 +185,7 @@ pub fn hex(bytes: &[u8]) -> String {
 /// The firmware-signing keys a device accepts, by key id.
 #[derive(Debug, Clone, Default)]
 pub struct Keyring {
-    keys: Vec<(String, VerifyingKey)>,
+    keys: Vec<(String, PublicKey)>,
 }
 
 impl Keyring {
@@ -186,7 +196,8 @@ impl Keyring {
         let keys = pems
             .into_iter()
             .map(|(id, pem)| {
-                VerifyingKey::from_public_key_pem(pem.trim())
+                spki_from_pem(pem)
+                    .and_then(|spki| PublicKey::from_spki(&spki))
                     .map(|k| (id.to_string(), k))
                     .map_err(|e| format!("signing key {id}: not a P-256 public key PEM ({e})"))
             })
@@ -212,11 +223,59 @@ impl Keyring {
         let der = B64
             .decode(sig_b64.trim())
             .map_err(|_| "the signature is not base64".to_string())?;
-        let sig =
-            Signature::from_der(&der).map_err(|_| "the signature is not DER ECDSA".to_string())?;
-        key.verify(message, &sig)
-            .map_err(|_| format!("the signature does not verify with {key_id}"))
+        key.verify(message, &der)
+            .map_err(|rejected| match rejected {
+                Rejected::Malformed => "the signature is not DER ECDSA".to_string(),
+                Rejected::Mismatch => format!("the signature does not verify with {key_id}"),
+            })
     }
+}
+
+/// Why a backend refused a signature.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Rejected {
+    /// Not a DER ECDSA signature.
+    Malformed,
+    /// Well formed, but not by this key over these bytes.
+    Mismatch,
+}
+
+/// The DER SubjectPublicKeyInfo of a P-256 key with an uncompressed point,
+/// up to the point's coordinates: SEQUENCE { SEQUENCE { id-ecPublicKey,
+/// prime256v1 }, BIT STRING { 0x04 ... } }. What `ergo product init`,
+/// OpenSSL and the `p256` crate write.
+const P256_SPKI_PREFIX: [u8; 27] = [
+    0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x08, 0x2a,
+    0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x03, 0x42, 0x00, 0x04,
+];
+
+/// The DER inside a `PUBLIC KEY` PEM, if it is a P-256 key in the one
+/// layout both backends accept. platform-build checks the keyring on the
+/// host, so a key the device would refuse fails the build instead.
+fn spki_from_pem(pem: &str) -> Result<Vec<u8>, String> {
+    let mut lines = pem.trim().lines().map(str::trim);
+    if lines.next() != Some("-----BEGIN PUBLIC KEY-----") {
+        return Err("no BEGIN PUBLIC KEY line".into());
+    }
+    let mut body = String::new();
+    let mut ended = false;
+    for line in lines.by_ref() {
+        if line == "-----END PUBLIC KEY-----" {
+            ended = true;
+            break;
+        }
+        body.push_str(line);
+    }
+    if !ended || lines.next().is_some() {
+        return Err("no END PUBLIC KEY line at the end".into());
+    }
+    let der = B64
+        .decode(body)
+        .map_err(|_| "the body is not base64".to_string())?;
+    if der.len() != P256_SPKI_PREFIX.len() + 64 || !der.starts_with(&P256_SPKI_PREFIX) {
+        return Err("not a P-256 SubjectPublicKeyInfo with an uncompressed point".into());
+    }
+    Ok(der)
 }
 
 /// What an image must hash to.
@@ -273,7 +332,7 @@ impl ImageCheck {
 mod tests {
     use super::*;
     use p256::ecdsa::signature::Signer;
-    use p256::ecdsa::SigningKey;
+    use p256::ecdsa::{Signature, SigningKey};
     use p256::pkcs8::{EncodePublicKey, LineEnding};
 
     // The contract/v1 test vector, checked by the release tooling too.
@@ -381,6 +440,40 @@ mod tests {
     #[test]
     fn bad_keys_are_refused() {
         assert!(Keyring::from_pems([("x", "not a pem")]).is_err());
+        let pem = |der: &[u8]| {
+            format!(
+                "-----BEGIN PUBLIC KEY-----\n{}\n-----END PUBLIC KEY-----\n",
+                B64.encode(der)
+            )
+        };
+        let spki = spki_from_pem(V1_KEY).unwrap();
+        assert!(Keyring::from_pems([("x", pem(&spki).as_str())]).is_ok());
+        // Not on the curve.
+        let mut off_curve = spki.clone();
+        off_curve[90] ^= 1;
+        let err = Keyring::from_pems([("x", pem(&off_curve).as_str())]).unwrap_err();
+        assert!(
+            err.starts_with("signing key x: not a P-256 public key PEM ("),
+            "{err}"
+        );
+        // A compressed point, which the device backend does not take.
+        let compressed = key().verifying_key().to_sec1_point(true);
+        let mut der = P256_SPKI_PREFIX[..23].to_vec();
+        der.extend([0x03, 0x22, 0x00]);
+        der.extend(compressed.as_bytes());
+        der[1] = (der.len() - 2) as u8;
+        assert!(Keyring::from_pems([("x", pem(&der).as_str())]).is_err());
+        // Another named curve (1.2.840.10045.3.1.6, prime239v3).
+        let mut other_curve = spki.clone();
+        other_curve[22] = 0x06;
+        assert!(Keyring::from_pems([("x", pem(&other_curve).as_str())]).is_err());
+        // Armor.
+        let body = V1_KEY.replace("PUBLIC KEY", "EC PUBLIC KEY");
+        assert!(Keyring::from_pems([("x", body.as_str())]).is_err());
+        let trailing = format!("{V1_KEY}junk\n");
+        assert!(Keyring::from_pems([("x", trailing.as_str())]).is_err());
+        let crlf = V1_KEY.replace('\n', "\r\n");
+        assert!(Keyring::from_pems([("x", crlf.as_str())]).is_ok());
         assert!(Keyring::default().is_empty());
         assert_eq!(keyring().ids().collect::<Vec<_>>(), ["test-a"]);
     }
