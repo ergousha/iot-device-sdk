@@ -20,7 +20,7 @@ license.workspace = true
 # enables it (plan Phase 6); the controller sends only signed job documents.
 [features]
 atecc608 = []
-nvs-soft-key = []
+nvs-soft-key = ["dep:p256"]
 signed-only = []
 
 [dependencies]
@@ -32,6 +32,6 @@ anyhow = "1"
 log.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-# The soft key: generation, CSR signing, PKCS#8 for esp-tls. iot-jobs links it
-# for manifest verification already.
-p256.workspace = true
+# The soft key: generation, CSR signing, PKCS#8 for esp-tls. Only the
+# nvs-soft-key build links it; manifest verification uses mbedTLS (iot-jobs).
+p256 = { workspace = true, optional = true }
